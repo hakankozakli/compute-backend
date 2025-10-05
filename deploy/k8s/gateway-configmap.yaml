@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vyvo-gateway-config
+  namespace: vyvo-compute
+  labels:
+    app: vyvo-gateway
+data:
+  config.yaml: |
+    listen_addr: ":8080"
+    queue_base_url: "https://queue.vyvo.dev"
+    orchestrator_url: "http://vyvo-orchestrator:8081"

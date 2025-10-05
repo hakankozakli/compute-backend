@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vyvo-postgres
+  namespace: vyvo-compute
+  labels:
+    app: vyvo-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vyvo-postgres
+  template:
+    metadata:
+      labels:
+        app: vyvo-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_DB
+              value: vyvo
+            - name: POSTGRES_USER
+              value: vyvo
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vyvo-postgres-secret
+                  key: password
+          ports:
+            - containerPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vyvo-postgres
+  namespace: vyvo-compute
+spec:
+  selector:
+    app: vyvo-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vyvo-postgres-secret
+  namespace: vyvo-compute
+stringData:
+  password: vyvo

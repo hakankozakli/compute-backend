@@ -1,0 +1,29 @@
+# General
+.DS_Store
+*.log
+.env
+.env.*
+/tmp
+
+# Go
+bin/
+*.test
+
+# Rust
+/target
+**/Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+.venv/
+
+# Node / Misc
+node_modules/
+
+# Generated assets
+artifacts/
+coverage/

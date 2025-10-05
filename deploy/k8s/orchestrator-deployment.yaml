@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vyvo-orchestrator
+  namespace: vyvo-compute
+  labels:
+    app: vyvo-orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vyvo-orchestrator
+  template:
+    metadata:
+      labels:
+        app: vyvo-orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: ghcr.io/vyvo/compute-orchestrator:latest
+          ports:
+            - containerPort: 8081
+          env:
+            - name: RUST_LOG
+              value: "info"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vyvo-orchestrator
+  namespace: vyvo-compute
+spec:
+  selector:
+    app: vyvo-orchestrator
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081

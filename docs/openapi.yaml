@@ -1,0 +1,314 @@
+openapi: 3.0.3
+info:
+  title: Vyvo Compute Gateway API
+  version: 0.1.0
+  description: |
+    fal.ai-compatible HTTP interface for queue and synchronous model invocations.
+    Streaming semantics (SSE/WS) and admin/webhook endpoints will be added in future revisions.
+servers:
+  - url: https://queue.vyvo.dev
+    description: Queue base hostname (async requests)
+  - url: https://vyvo.dev
+    description: Synchronous base hostname
+tags:
+  - name: Queue
+    description: Asynchronous job submission and tracking
+  - name: Sync
+    description: Low-latency synchronous requests
+  - name: Health
+    description: Liveness probes
+security:
+  - ApiKeyAuth: []
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        '200':
+          description: Gateway is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /{modelId}:
+    post:
+      tags: [Queue]
+      summary: Submit asynchronous job
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/FalWebhook'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: Model-specific input JSON (schema defined per model)
+      responses:
+        '201':
+          description: Job accepted and queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmissionEnvelope'
+        '4XX':
+          $ref: '#/components/responses/ClientError'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+  /{modelId}/requests/{requestId}:
+    get:
+      tags: [Queue]
+      summary: Retrieve job response payload
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Job completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '202':
+          description: Job still pending or in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+  /{modelId}/requests/{requestId}/status:
+    get:
+      tags: [Queue]
+      summary: Poll job status
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/IncludeLogs'
+      responses:
+        '200':
+          description: Current job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+  /{modelId}/requests/{requestId}/status/stream:
+    get:
+      tags: [Queue]
+      summary: Stream job status updates via SSE
+      description: >-
+        Emits Server-Sent Events containing the same JSON payload as the status polling endpoint until
+        the job reaches a terminal state.
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Event stream of status updates
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: "data: {\"status\": \"IN_PROGRESS\"}\n\n"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+  /{modelId}/requests/{requestId}/cancel:
+    put:
+      tags: [Queue]
+      summary: Request job cancellation
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202':
+          description: Cancellation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
+        '400':
+          description: Job already completed or ineligible for cancel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+  /sync/{modelId}:
+    post:
+      tags: [Sync]
+      summary: Invoke a synchronous model endpoint
+      servers:
+        - url: https://vyvo.dev
+      parameters:
+        - $ref: '#/components/parameters/ModelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Model output payload
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '4XX':
+          $ref: '#/components/responses/ClientError'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: 'Use the format: Key <API_KEY>'
+  parameters:
+    ModelId:
+      name: modelId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Fully-qualified model identifier (e.g., `fal-ai/fast-sdxl`)
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Request identifier returned from queue submission
+    IncludeLogs:
+      name: logs
+      in: query
+      required: false
+      schema:
+        type: integer
+        enum: [0, 1]
+      description: Set to 1 to include logs in status response
+    FalWebhook:
+      name: fal_webhook
+      in: query
+      required: false
+      schema:
+        type: string
+        format: uri
+      description: HTTPS endpoint to receive webhook callbacks
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: resource not found
+    ClientError:
+      description: Client error (validation, auth, rate limits)
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/ErrorResponse'
+              - $ref: '#/components/schemas/ValidationError'
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: internal error
+  schemas:
+    SubmissionEnvelope:
+      type: object
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        response_url:
+          type: string
+          format: uri
+        status_url:
+          type: string
+          format: uri
+        cancel_url:
+          type: string
+          format: uri
+      required: [request_id, response_url, status_url, cancel_url]
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [IN_QUEUE, IN_PROGRESS, COMPLETED, ERROR]
+        queue_position:
+          type: integer
+          minimum: 0
+        response_url:
+          type: string
+          format: uri
+        logs:
+          type: array
+          items:
+            type: string
+      required: [status, response_url]
+    CancelResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [CANCELLATION_REQUESTED, ALREADY_COMPLETED, TOO_LATE, NOT_FOUND]
+      required: [status]
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+    ValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+      required: [detail]
+    ErrorDetail:
+      type: object
+      properties:
+        type:
+          type: string
+        loc:
+          type: array
+          items:
+            type: string
+        msg:
+          type: string
+        ctx:
+          type: object
+          additionalProperties: true
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok

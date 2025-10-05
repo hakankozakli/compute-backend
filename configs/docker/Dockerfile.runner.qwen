@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY runners/pyproject.toml ./pyproject.toml
+RUN pip install poetry && poetry config virtualenvs.create false && poetry install --no-root
+COPY runners/qwen_image ./qwen_image
+EXPOSE 9001
+CMD ["uvicorn", "qwen_image.app:app", "--host", "0.0.0.0", "--port", "9001"]

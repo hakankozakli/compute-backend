@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vyvo-gateway
+  namespace: vyvo-compute
+  labels:
+    app: vyvo-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vyvo-gateway
+  template:
+    metadata:
+      labels:
+        app: vyvo-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/vyvo/compute-gateway:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: GATEWAY_LISTEN_ADDR
+              value: ":8080"
+            - name: GATEWAY_QUEUE_BASE_URL
+              value: "https://queue.vyvo.dev"
+            - name: GATEWAY_ORCHESTRATOR_URL
+              value: "http://vyvo-orchestrator:8081"
+          volumeMounts:
+            - name: gateway-config
+              mountPath: /app/configs
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: gateway-config
+          configMap:
+            name: vyvo-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vyvo-gateway
+  namespace: vyvo-compute
+spec:
+  selector:
+    app: vyvo-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vyvo-gateway
+  namespace: vyvo-compute
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: queue.vyvo.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vyvo-gateway
+                port:
+                  number: 80

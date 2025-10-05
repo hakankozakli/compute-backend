@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY runners/pyproject.toml ./pyproject.toml
+RUN pip install poetry && poetry config virtualenvs.create false && poetry install --no-root
+COPY runners/video_to_audio ./video_to_audio
+EXPOSE 9003
+CMD ["uvicorn", "video_to_audio.app:app", "--host", "0.0.0.0", "--port", "9003"]

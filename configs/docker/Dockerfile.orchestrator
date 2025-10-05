@@ -1,0 +1,15 @@
+FROM rust:1.78 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY orchestrator/Cargo.toml orchestrator/Cargo.toml
+RUN mkdir -p orchestrator/src
+RUN echo "fn main() {}" > orchestrator/src/main.rs
+RUN cargo build --release -p orchestrator || true
+COPY . .
+RUN cargo build --release -p orchestrator
+
+FROM gcr.io/distroless/cc
+COPY --from=build /src/target/release/orchestrator /app/orchestrator
+WORKDIR /app
+EXPOSE 8081
+ENTRYPOINT ["/app/orchestrator"]

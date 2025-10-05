@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY runners/pyproject.toml ./pyproject.toml
+RUN pip install poetry && poetry config virtualenvs.create false && poetry install --no-root
+COPY runners/wan_video ./wan_video
+EXPOSE 9002
+CMD ["uvicorn", "wan_video.app:app", "--host", "0.0.0.0", "--port", "9002"]

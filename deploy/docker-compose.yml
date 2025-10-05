@@ -1,0 +1,111 @@
+version: "3.9"
+
+services:
+  gateway:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.gateway
+    environment:
+      - GATEWAY_LISTEN_ADDR=:8080
+      - GATEWAY_QUEUE_BASE_URL=http://localhost:8080
+      - GATEWAY_ORCHESTRATOR_URL=http://orchestrator:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      - orchestrator
+
+  orchestrator:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.orchestrator
+    environment:
+      - RUST_LOG=info
+    ports:
+      - "8081:8081"
+
+  workflow_engine:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.workflow
+    ports:
+      - "8082:8082"
+    depends_on:
+      - orchestrator
+
+  admin_rest:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.admin
+    ports:
+      - "8083:8083"
+
+  webhook_dispatcher:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.webhook
+    depends_on:
+      - orchestrator
+
+  runner_qwen_image:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.runner.qwen
+    environment:
+      - PORT=9001
+    ports:
+      - "9001:9001"
+
+  runner_wan_video:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.runner.wan
+    environment:
+      - PORT=9002
+    ports:
+      - "9002:9002"
+
+  runner_video_to_audio:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.runner.audio
+    environment:
+      - PORT=9003
+    ports:
+      - "9003:9003"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=vyvo
+      - POSTGRES_USER=vyvo
+      - POSTGRES_PASSWORD=vyvo
+    ports:
+      - "5432:5432"
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9000"
+    environment:
+      - MINIO_ROOT_USER=vyvo
+      - MINIO_ROOT_PASSWORD=password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  otel_collector:
+    image: otel/opentelemetry-collector:0.99.0
+    command: ["--config=/etc/otel-config.yaml"]
+    volumes:
+      - ../configs/otel/otel-config.yaml:/etc/otel-config.yaml
+    depends_on:
+      - gateway
+      - orchestrator
+
+volumes:
+  postgres_data:
+  minio_data:

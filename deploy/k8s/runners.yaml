@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vyvo-runner-qwen
+  namespace: vyvo-compute
+  labels:
+    app: vyvo-runner-qwen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vyvo-runner-qwen
+  template:
+    metadata:
+      labels:
+        app: vyvo-runner-qwen
+    spec:
+      containers:
+        - name: runner
+          image: ghcr.io/vyvo/runner-qwen:latest
+          ports:
+            - containerPort: 9001
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vyvo-runner-qwen
+  namespace: vyvo-compute
+spec:
+  selector:
+    app: vyvo-runner-qwen
+  ports:
+    - name: http
+      port: 9001
+      targetPort: 9001
