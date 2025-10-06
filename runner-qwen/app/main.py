@@ -1,19 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import os
 import time
-from typing import Any
+import uuid
+from dataclasses import dataclass
+from typing import Any, Iterable, List
 
 from fastapi import FastAPI, HTTPException
 from loguru import logger
+from minio import Minio
+from minio.error import S3Error
 from pydantic import BaseModel, Field
+
+try:  # Optional dependency; only needed when DashScope backend is enabled
+    from dashscope import ImageSynthesis
+    from dashscope.api_entities import ImageSynthesisOutput
+    from dashscope.client.base import DashScopeAPIResponse
+    from dashscope.error import DashScopeAPIError
+except Exception:  # pragma: no cover - dashscope is optional at runtime
+    ImageSynthesis = None  # type: ignore
+    DashScopeAPIResponse = Any  # type: ignore
+    DashScopeAPIError = Exception  # type: ignore
 
 
 class ModelSettings(BaseModel):
-    model_id: str = Field(default="fal-ai/fast-sdxl", description="External model identifier")
+    model_id: str = Field(default="qwen/image", description="External model identifier")
     default_steps: int = Field(default=20, ge=1, le=150)
     default_guidance: float = Field(default=8.5, ge=0.0, le=30.0)
+    default_size: str = Field(default=os.getenv("QWEN_IMAGE_SIZE", "1024*1024"))
 
 
 class InvokeRequest(BaseModel):
@@ -23,6 +40,7 @@ class InvokeRequest(BaseModel):
     steps: int | None = Field(default=None, ge=1, le=150)
     guidance_scale: float | None = Field(default=None, ge=0.0, le=30.0)
     image_count: int = Field(default=1, ge=1, le=4)
+    size: str | None = Field(default=None, pattern=r"^\d{3,4}\*\d{3,4}$")
 
 
 class ImageArtifact(BaseModel):
@@ -39,15 +57,302 @@ class InvokeResponse(BaseModel):
     outputs: list[ImageArtifact]
 
 
-app = FastAPI(title="Vyvo Qwen Image Runner", version="0.1.0")
+@dataclass
+class BackendResult:
+    request_id: str
+    outputs: List[ImageArtifact]
+    inference_seconds: float
+
+
+class MinIOStorage:
+    def __init__(self) -> None:
+        endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+        access_key = os.getenv("MINIO_ACCESS_KEY", "vyvo")
+        secret_key = os.getenv("MINIO_SECRET_KEY", "vyvo-secure-password-change-me")
+        secure = os.getenv("MINIO_SECURE", "false").lower() in ("true", "1", "yes")
+        self.bucket = os.getenv("MINIO_BUCKET", "generated-images")
+
+        self.client = Minio(
+            endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure,
+        )
+
+        # Ensure bucket exists
+        try:
+            if not self.client.bucket_exists(self.bucket):
+                self.client.make_bucket(self.bucket)
+                logger.info("Created MinIO bucket: {}", self.bucket)
+        except S3Error as exc:
+            logger.error("Failed to check/create bucket: {}", exc)
+
+    def upload_image(self, image_data: bytes, filename: str) -> str:
+        """Upload image to MinIO and return the URL"""
+        try:
+            self.client.put_object(
+                self.bucket,
+                filename,
+                io.BytesIO(image_data),
+                len(image_data),
+                content_type="image/png",
+            )
+            # Return URL (adjust this based on your MinIO public URL)
+            endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT", os.getenv("MINIO_ENDPOINT", "localhost:9000"))
+            secure = os.getenv("MINIO_SECURE", "false").lower() in ("true", "1", "yes")
+            protocol = "https" if secure else "http"
+            return f"{protocol}://{endpoint}/{self.bucket}/{filename}"
+        except S3Error as exc:
+            logger.error("Failed to upload image: {}", exc)
+            raise HTTPException(status_code=500, detail="Failed to upload image to storage")
+
+
+class ImageBackend:
+    async def generate(self, request: InvokeRequest) -> BackendResult:  # pragma: no cover - protocol
+        raise NotImplementedError
+
+
+class StubBackend(ImageBackend):
+    async def generate(self, request: InvokeRequest) -> BackendResult:
+        start = time.perf_counter()
+        request_id = uuid.uuid4().hex
+        await asyncio.sleep(0.05)
+        outputs = [
+            ImageArtifact(
+                url=f"https://cdn.vyvo.local/mock/{request_id}-{idx}.png",
+                seed=(request.seed or 0) + idx,
+            )
+            for idx in range(request.image_count)
+        ]
+        elapsed = time.perf_counter() - start
+        logger.warning(
+            "Using stub backend for request_id={} (no real backend configured)",
+            request_id,
+        )
+        return BackendResult(request_id=request_id, outputs=outputs, inference_seconds=elapsed)
+
+
+class DashScopeBackend(ImageBackend):
+    def __init__(self, api_key: str, model: str, settings: ModelSettings) -> None:
+        if ImageSynthesis is None:
+            raise RuntimeError("dashscope package is not available")
+        os.environ.setdefault("DASHSCOPE_API_KEY", api_key)
+        self.model = model
+        self.settings = settings
+
+    async def generate(self, request: InvokeRequest) -> BackendResult:
+        prompt = request.prompt
+        negative_prompt = request.negative_prompt or ""
+        image_count = request.image_count
+        size = request.size or self.settings.default_size
+        guidance = request.guidance_scale or self.settings.default_guidance
+        steps = request.steps or self.settings.default_steps
+
+        def _call_dashscope() -> DashScopeAPIResponse:
+            return ImageSynthesis.call(  # type: ignore[operator]
+                model=self.model,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                n=image_count,
+                size=size,
+                guidance_scale=guidance,
+                steps=steps,
+            )
+
+        start = time.perf_counter()
+        try:
+            response = await asyncio.to_thread(_call_dashscope)
+        except DashScopeAPIError as exc:  # pragma: no cover - relies on external API
+            logger.exception("DashScope API error: {}", exc)
+            raise HTTPException(status_code=502, detail="dashscope_error") from exc
+
+        elapsed = time.perf_counter() - start
+        if response.status_code != 200:
+            message = getattr(response, "message", "dashscope_error")
+            logger.error("DashScope returned non-200: {}", message)
+            raise HTTPException(status_code=502, detail=message)
+
+        request_id = getattr(response, "request_id", uuid.uuid4().hex)
+        outputs: list[ImageArtifact] = []
+        raw_output = getattr(response, "output", [])
+        logger.debug("DashScope raw output size={} request_id={}", len(raw_output), request_id)
+
+        for idx, item in enumerate(raw_output):
+            url = None
+            if isinstance(item, ImageSynthesisOutput):  # pragma: no cover - depends on SDK
+                url = getattr(item, "url", None)
+            elif isinstance(item, dict):
+                url = item.get("url") or item.get("image_url")
+            else:
+                url = getattr(item, "url", None)
+
+            if not url:
+                logger.warning("DashScope output {} missing url, skipping", idx)
+                continue
+
+            outputs.append(
+                ImageArtifact(
+                    url=url,
+                    seed=(request.seed or 0) + idx,
+                )
+            )
+
+        if not outputs:
+            logger.error("DashScope response contained no usable outputs")
+            raise HTTPException(status_code=502, detail="dashscope_no_output")
+
+        return BackendResult(request_id=request_id, outputs=outputs, inference_seconds=elapsed)
+
+
+class DiffusersBackend(ImageBackend):
+    def __init__(self, settings: ModelSettings, storage: MinIOStorage | None = None) -> None:
+        import torch
+        from diffusers import AutoPipelineForText2Image
+
+        model_id = os.getenv("QWEN_DIFFUSERS_MODEL", "Qwen/Qwen-Image")
+        torch_dtype_str = os.getenv("QWEN_TORCH_DTYPE", "float16")
+        device = os.getenv("QWEN_DEVICE", "cuda")
+        hf_token = os.getenv("HF_TOKEN")
+        trust_remote = os.getenv("QWEN_TRUST_REMOTE_CODE", "1") not in {"0", "false", "False"}
+        enable_xformers = os.getenv("QWEN_ENABLE_XFORMERS", "1") not in {"0", "false", "False"}
+        enable_tf32 = os.getenv("QWEN_ENABLE_TF32", "1") not in {"0", "false", "False"}
+
+        logger.info(
+            "Loading diffusers pipeline model={} dtype={} device={} trust_remote_code={}",
+            model_id,
+            torch_dtype_str,
+            device,
+            trust_remote,
+        )
+
+        torch_dtype = getattr(torch, torch_dtype_str, torch.float16)
+        pipeline_kwargs: dict[str, Any] = {
+            "torch_dtype": torch_dtype,
+            "use_safetensors": True,
+            "trust_remote_code": trust_remote,
+        }
+        if torch_dtype == torch.float16:
+            pipeline_kwargs["variant"] = "fp16"
+        if hf_token:
+            pipeline_kwargs["token"] = hf_token
+
+        self.pipeline = AutoPipelineForText2Image.from_pretrained(  # type: ignore[arg-type]
+            model_id,
+            **pipeline_kwargs,
+        )
+
+        if enable_xformers:
+            try:
+                self.pipeline.enable_xformers_memory_efficient_attention()
+                logger.info("Enabled xFormers memory efficient attention")
+            except Exception as exc:  # pragma: no cover - depends on build
+                logger.warning("Failed to enable xFormers: {}", exc)
+
+        if enable_tf32 and torch.backends.cuda.is_available():  # pragma: no cover - hardware dependent
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        self.pipeline.to(device)
+        self.device = device
+        self.settings = settings
+        self.torch = torch
+        self.storage = storage
+
+    async def generate(self, request: InvokeRequest) -> BackendResult:
+        prompt = request.prompt
+        negative_prompt = request.negative_prompt or None
+        steps = request.steps or self.settings.default_steps
+        guidance = request.guidance_scale or self.settings.default_guidance
+        image_count = request.image_count
+        generator = None
+        if request.seed is not None:
+            generator = self.torch.Generator(device=self.device).manual_seed(int(request.seed))
+
+        def _run_pipeline() -> Iterable[Any]:
+            result = self.pipeline(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                num_images_per_prompt=image_count,
+                generator=generator,
+            )
+            return result.images
+
+        start = time.perf_counter()
+        images = await asyncio.to_thread(_run_pipeline)
+        elapsed = time.perf_counter() - start
+        request_id = uuid.uuid4().hex
+
+        outputs: list[ImageArtifact] = []
+        for idx, image in enumerate(images):
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            image_data = buffer.getvalue()
+
+            # Upload to MinIO if available, otherwise use base64
+            if self.storage:
+                filename = f"{request_id}-{idx}.png"
+                url = await asyncio.to_thread(self.storage.upload_image, image_data, filename)
+            else:
+                data = base64.b64encode(image_data).decode("utf-8")
+                url = f"data:image/png;base64,{data}"
+
+            outputs.append(
+                ImageArtifact(
+                    url=url,
+                    seed=(request.seed or 0) + idx,
+                )
+            )
+
+        return BackendResult(request_id=request_id, outputs=outputs, inference_seconds=elapsed)
+
+
+def build_backend(settings: ModelSettings) -> ImageBackend:
+    # Initialize MinIO storage if configured
+    storage: MinIOStorage | None = None
+    if os.getenv("MINIO_ENDPOINT"):
+        try:
+            storage = MinIOStorage()
+            logger.info("MinIO storage initialized successfully")
+        except Exception as exc:
+            logger.warning("Failed to initialize MinIO storage, will use base64: {}", exc)
+
+    diffusers_model = os.getenv("QWEN_DIFFUSERS_MODEL")
+    if diffusers_model:
+        try:
+            logger.info("Using Diffusers backend with model={}", diffusers_model)
+            return DiffusersBackend(settings=settings, storage=storage)
+        except Exception as exc:
+            logger.exception("Failed to initialize Diffusers backend: {}", exc)
+
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if api_key:
+        model = os.getenv("QWEN_IMAGE_MODEL", "wanx2.1")
+        logger.info("Using DashScope backend with model={}", model)
+        try:
+            return DashScopeBackend(api_key=api_key, model=model, settings=settings)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed to initialize DashScope backend: {}", exc)
+
+    logger.info("Using stub backend (no real backend configured)")
+    return StubBackend()
+
+
+app = FastAPI(title="Vyvo Qwen Image Runner", version="0.4.0")
 settings = ModelSettings()
+backend: ImageBackend = build_backend(settings)
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
     logger.remove()
     logger.add(lambda msg: print(msg, end=""), level=os.getenv("LOG_LEVEL", "INFO"))
-    logger.info("runner starting with model_id={}", settings.model_id)
+    logger.info(
+        "runner starting with model_id={} backend={}",
+        settings.model_id,
+        backend.__class__.__name__,
+    )
 
 
 @app.get("/healthz")
@@ -58,36 +363,28 @@ async def healthcheck() -> dict[str, str]:
 @app.post("/invoke", response_model=InvokeResponse)
 async def invoke(request: InvokeRequest) -> InvokeResponse:
     start = time.perf_counter()
-    request_id = os.urandom(16).hex()
-    logger.info("invoke received request_id={} prompt_length={} images={}", request_id, len(request.prompt), request.image_count)
+    result = await backend.generate(request)
+    total_elapsed = time.perf_counter() - start
 
-    await asyncio.sleep(0.1)  # simulate warmup / scheduling delay
+    timings = {
+        "dispatch": max(round(total_elapsed - result.inference_seconds, 4), 0.0),
+        "inference": round(result.inference_seconds, 4),
+        "total": round(total_elapsed, 4),
+    }
 
-    try:
-        artifacts = [
-            ImageArtifact(
-                url=f"https://cdn.vyvo.local/mock/{request_id}-{i}.png",
-                seed=(request.seed or 0) + i,
-            )
-            for i in range(request.image_count)
-        ]
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception("artifact generation failed for request_id={}", request_id)
-        raise HTTPException(status_code=500, detail="artifact_generation_error") from exc
-
-    elapsed = time.perf_counter() - start
-    response = InvokeResponse(
-        model_id=settings.model_id,
-        request_id=request_id,
-        timings={
-            "total": elapsed,
-            "dispatch": 0.05,
-            "inference": max(elapsed - 0.05, 0),
-        },
-        outputs=artifacts,
+    logger.info(
+        "invoke completed request_id={} total={:.4f}s backend={}",
+        result.request_id,
+        total_elapsed,
+        backend.__class__.__name__,
     )
-    logger.info("invoke completed request_id={} elapsed={:.3f}s", request_id, elapsed)
-    return response
+
+    return InvokeResponse(
+        model_id=settings.model_id,
+        request_id=result.request_id,
+        timings=timings,
+        outputs=result.outputs,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

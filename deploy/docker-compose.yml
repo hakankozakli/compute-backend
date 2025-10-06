@@ -73,6 +73,18 @@ services:
     ports:
       - "9003:9003"
 
+  control_plane:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.control-plane
+    environment:
+      - CONTROL_PLANE_ADDR=:3001
+      - CONTROL_PLANE_DATA=/var/lib/vyvo/nodes.json
+    volumes:
+      - control_plane_data:/var/lib/vyvo
+    ports:
+      - "3001:3001"
+
   redis:
     image: redis:7-alpine
     ports:
@@ -109,3 +121,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  control_plane_data:

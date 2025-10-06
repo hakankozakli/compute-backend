@@ -4,7 +4,7 @@
 .env
 .env.*
 /tmp
-
+/.gocache
 # Go
 bin/
 *.test
@@ -27,3 +27,5 @@ node_modules/
 # Generated assets
 artifacts/
 coverage/
+
+control-plane

@@ -1,6 +1,6 @@
 [project]
 name = "runner-qwen"
-version = "0.1.0"
+version = "0.3.0"
 description = "Vyvo Qwen image inference runner"
 authors = [{ name = "Vyvo Engineering", email = "eng@vyvo.com" }]
 readme = "README.md"
@@ -12,6 +12,13 @@ dependencies = [
     "httpx>=0.27",
     "python-multipart>=0.0.9",
     "loguru>=0.7",
+    "dashscope>=1.14.1",
+    "diffusers>=0.29",
+    "accelerate>=0.31",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "Pillow>=10.3",
+    "minio>=7.2.0",
 ]
 
 [project.optional-dependencies]

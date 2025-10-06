@@ -1,14 +1,14 @@
 package telemetry
 
 import (
-    "context"
-    "log"
+	"context"
+	"log"
 
-    "go.opentelemetry.io/otel"
-    "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
-    "go.opentelemetry.io/otel/sdk/resource"
-    sdktrace "go.opentelemetry.io/otel/sdk/trace"
-    semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 // InitTracer configures a simple stdout tracer suitable for local development.

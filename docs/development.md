@@ -12,7 +12,7 @@
    - Install runner dependencies via `poetry install` inside `runners/`.
 
 3. **Local stack**
-   - `docker compose -f deploy/docker-compose.yml up --build` launches gateway, orchestrator, runners, Redis, Postgres, MinIO, and the OTEL collector.
+   - `docker compose -f deploy/docker-compose.yml up --build` launches gateway, orchestrator, runners, Redis, Postgres, MinIO, the OTEL collector, and the control plane service (exposes `http://localhost:3001`).
    - Queue submission: `curl -X POST http://localhost:8080/fal-ai/fast-sdxl -H 'Content-Type: application/json' -d '{"prompt":"test"}'`.
    - Status polling: `curl http://localhost:8080/fal-ai/fast-sdxl/requests/<id>/status`.
    - SSE: `curl http://localhost:8080/fal-ai/fast-sdxl/requests/<id>/status/stream`.

@@ -12,6 +12,9 @@ admin:
 webhook:
 	GOCACHE=$(PWD)/.gocache CGO_ENABLED=0 go build ./cmd/webhook-dispatcher
 
+control-plane:
+	GOCACHE=$(PWD)/.gocache CGO_ENABLED=0 go build ./cmd/control-plane
+
 orchestrator:
 	cargo build -p orchestrator
 

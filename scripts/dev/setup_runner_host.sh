@@ -11,6 +11,7 @@ CONTAINER_RUNTIME="docker"    # docker or containerd
 COMPOSE_VERSION="v2.29.2"
 REPO_ROOT="/opt/vyvo"
 SERVICE_USER="vyvo"
+ENV_FILE="/etc/vyvo/qwen.env"
 
 log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
@@ -49,7 +50,7 @@ install_nvidia_drivers() {
 install_docker() {
   log "Installing Docker Engine"
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --yes --batch --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo \
 "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
@@ -120,34 +121,73 @@ layout_repo() {
   mkdir -p "$REPO_ROOT"
   chown "$SERVICE_USER" "$REPO_ROOT"
 
-  cat <<'COMPOSE' > "$REPO_ROOT/docker-compose.yml"
-version: "3.9"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    cat <<'ENV' > "$ENV_FILE"
+# Qwen image runner environment
+# Uncomment and populate the values below.
+# === Local diffusers backend (recommended for on-prem GPUs) ===
+# QWEN_DIFFUSERS_MODEL=Qwen/Qwen-Image
+# HF_TOKEN=hf_xxx  # only if the model requires auth
+# QWEN_TORCH_DTYPE=float16
+# QWEN_DEVICE=cuda
+# QWEN_TRUST_REMOTE_CODE=1
+# QWEN_ENABLE_XFORMERS=1
+# === DashScope fallback ===
+# DASHSCOPE_API_KEY=your_dashscope_key
+# QWEN_IMAGE_MODEL=wanx2.1
+# QWEN_IMAGE_SIZE=1024*1024
+ENV
+    chown "$SERVICE_USER":"$SERVICE_USER" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
 
+  cat <<COMPOSE > "$REPO_ROOT/docker-compose.yml"
 services:
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9090"
+    environment:
+      MINIO_ROOT_USER: vyvo
+      MINIO_ROOT_PASSWORD: vyvo-secure-password-change-me
+    ports:
+      - "9000:9000"
+      - "9090:9090"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
   qwen-image:
-    image: ghcr.io/vyvo/runner-qwen:latest
+    image: ghcr.io/hakankozakli/runner-qwen:latest
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      - minio
+    env_file:
+      - $ENV_FILE
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - VYVO_MODEL_ID=fal-ai/fast-sdxl
+      NVIDIA_VISIBLE_DEVICES: all
+      VYVO_MODEL_ID: qwen/image
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: vyvo
+      MINIO_SECRET_KEY: vyvo-secure-password-change-me
+      MINIO_BUCKET: generated-images
+      MINIO_SECURE: "false"
     ports:
       - "9001:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9001/healthz"]
       interval: 30s
       timeout: 5s
-      retries: 3
+      retries: 5
 
-  wan-video:
-    image: ghcr.io/vyvo/runner-wan:latest
-    restart: unless-stopped
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - VYVO_MODEL_ID=wan/2.2
-    ports:
-      - "9002:9002"
+volumes:
+  minio-data:
 COMPOSE
 
   chown "$SERVICE_USER":"$SERVICE_USER" "$REPO_ROOT"/docker-compose.yml
