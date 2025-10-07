@@ -5,6 +5,9 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# Install git for pip installing from GitHub
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY pyproject.toml README.md ./
 RUN pip install --upgrade pip && pip install build
@@ -13,10 +16,11 @@ RUN python -m build --wheel --outdir /dist
 
 FROM python:3.11-slim
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu121
-ARG TORCH_VERSION=2.3.1
+ARG TORCH_VERSION=2.6.0
 ENV VIRTUAL_ENV=/opt/venv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
         curl \
         libglib2.0-0 \
         libsm6 \
@@ -29,12 +33,13 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /app
 COPY --from=builder /dist/*.whl ./
+COPY run_worker.py ./
 
 RUN pip install --no-cache-dir --extra-index-url ${TORCH_INDEX} \
-        torch==${TORCH_VERSION} torchvision==0.18.1 torchaudio==2.3.1
+        torch==${TORCH_VERSION} torchvision==0.21.0 torchaudio==2.6.0
 
-# Try to install xformers, but don't fail if it doesn't work
-RUN pip install --no-cache-dir --extra-index-url ${TORCH_INDEX} xformers==0.0.26.post1 || echo "xformers install failed, continuing without it"
+# Skip xformers for now - version 0.0.26.post1 downgrades torch to 2.3.0
+# RUN pip install --no-cache-dir --extra-index-url ${TORCH_INDEX} xformers==0.0.26.post1 || echo "xformers install failed, continuing without it"
 
 RUN pip install --no-cache-dir *.whl && rm *.whl
 

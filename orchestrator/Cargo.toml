@@ -17,6 +17,7 @@ serde_with = "3"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio-stream = "0.1"
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 [build-dependencies]
 tonic-build = "0.11"

@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # Storage Layer
+  minio:
+    image: minio/minio:latest
+    container_name: vyvo-minio
+    ports:
+      - "9000:9000"   # API
+      - "9090:9090"   # Console
+    environment:
+      - MINIO_ROOT_USER=vyvo
+      - MINIO_ROOT_PASSWORD=vyvo-secure-password-change-me
+    command: server /data --console-address ":9090"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Queue Layer
+  redis:
+    image: redis:7-alpine
+    container_name: vyvo-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Compute Layer - Qwen Workers
+  worker-qwen-1:
+    image: ghcr.io/hakankozakli/runner-qwen:latest
+    container_name: vyvo-worker-qwen-1
+    runtime: nvidia
+    environment:
+      - WORKER_MODEL_ID=qwen/image
+      - REDIS_URL=redis://redis:6379
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=vyvo
+      - MINIO_SECRET_KEY=vyvo-secure-password-change-me
+      - MINIO_BUCKET=generated-images
+      - MINIO_PUBLIC_URL=http://147.185.41.134:9000
+      - WORKER_ID=node1-worker-qwen-1
+      - LOG_LEVEL=INFO
+      - QWEN_DIFFUSERS_MODEL=Qwen/Qwen2.5-VL-7B-Image
+      - QWEN_DEVICE=cuda
+      - QWEN_TORCH_DTYPE=bfloat16
+      - ENABLE_TF32=true
+    command: python run_worker.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  worker-qwen-2:
+    image: ghcr.io/hakankozakli/runner-qwen:latest
+    container_name: vyvo-worker-qwen-2
+    runtime: nvidia
+    environment:
+      - WORKER_MODEL_ID=qwen/image
+      - REDIS_URL=redis://redis:6379
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=vyvo
+      - MINIO_SECRET_KEY=vyvo-secure-password-change-me
+      - MINIO_BUCKET=generated-images
+      - MINIO_PUBLIC_URL=http://147.185.41.134:9000
+      - WORKER_ID=node1-worker-qwen-2
+      - LOG_LEVEL=INFO
+      - QWEN_DIFFUSERS_MODEL=Qwen/Qwen2.5-VL-7B-Image
+      - QWEN_DEVICE=cuda
+      - QWEN_TORCH_DTYPE=bfloat16
+      - ENABLE_TF32=true
+    command: python run_worker.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  redis-data:
+
+networks:
+  default:
+    name: vyvo-network

@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, watch};
 use tokio_stream::wrappers::WatchStream;
@@ -92,6 +93,7 @@ pub struct AppState {
 
 struct StateInner {
     jobs: RwLock<HashMap<Uuid, JobRecord>>,
+    redis: redis::Client,
 }
 
 struct JobRecord {
@@ -114,16 +116,23 @@ struct JobData {
 }
 
 impl AppState {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(redis_url: Option<String>) -> anyhow::Result<Self> {
+        let redis_url = redis_url.unwrap_or_else(|| "redis://redis:6379".to_string());
+        let redis = redis::Client::open(redis_url.as_str())
+            .context("failed to create redis client")?;
+
+        Ok(Self {
             inner: Arc::new(StateInner {
                 jobs: RwLock::new(HashMap::new()),
+                redis,
             }),
-        }
+        })
     }
 
     pub async fn create_job(&self, req: SubmitJobRequest) -> anyhow::Result<SubmitJobResponse> {
         let request_id = Uuid::new_v4();
+        let created_at = Utc::now();
+
         let data = JobData {
             request_id,
             model_id: req.model_id.clone(),
@@ -131,8 +140,8 @@ impl AppState {
             status: JobStatus::InQueue,
             result: None,
             logs: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at,
+            updated_at: created_at,
             store_io: req.store_io,
             fal_webhook: req.fal_webhook,
         };
@@ -146,14 +155,30 @@ impl AppState {
             result: None,
         });
 
+        // Store job in memory for status tracking
         {
             let mut jobs = self.inner.jobs.write().await;
-            jobs.insert(request_id, JobRecord { data, notifier: tx.clone() });
+            jobs.insert(request_id, JobRecord { data: data.clone(), notifier: tx.clone() });
         }
 
-        self.refresh_snapshot(request_id).await?;
+        // Enqueue in Redis for workers to pick up
+        let mut conn = self.inner.redis.get_multiplexed_async_connection().await?;
+        let queue_key = format!("queue:{}", data.model_id);
+        let job_key = format!("job:{}", request_id);
 
-        self.spawn_processing_task(request_id);
+        // Store job data in Redis
+        let job_json = serde_json::to_string(&serde_json::json!({
+            "id": request_id.to_string(),
+            "model": data.model_id,
+            "status": "pending",
+            "params": data.payload,
+            "created_at": created_at.timestamp(),
+        }))?;
+
+        conn.set_ex(&job_key, job_json, 86400).await?; // 24 hour TTL
+        conn.rpush(&queue_key, request_id.to_string()).await?;
+
+        self.refresh_snapshot(request_id).await?;
 
         Ok(SubmitJobResponse { request_id })
     }
@@ -233,38 +258,7 @@ impl AppState {
         Ok(snapshot)
     }
 
-    fn spawn_processing_task(&self, request_id: Uuid) {
-        let state = self.clone();
-        tokio::spawn(async move {
-            if let Err(err) = state.process_job(request_id).await {
-                tracing::error!(%request_id, "job processing failed: {err}");
-            }
-        });
-    }
-
-    async fn process_job(&self, request_id: Uuid) -> anyhow::Result<()> {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        self.transition_status(request_id, JobStatus::InProgress, Some("job dispatched to runner".into())).await?;
-        tokio::time::sleep(Duration::from_millis(800)).await;
-
-        let result = serde_json::json!({
-            "request_id": request_id,
-            "outputs": [
-                {
-                    "type": "image",
-                    "url": format!("https://cdn.vyvo.local/outputs/{}.png", Uuid::new_v4()),
-                }
-            ],
-            "metrics": {
-                "inference_ms": 800,
-                "time_to_first_byte_ms": 120
-            }
-        });
-
-        self.set_result(request_id, result, Some("job completed".into())).await
-    }
-
-    async fn transition_status(&self, request_id: Uuid, status: JobStatus, log: Option<String>) -> anyhow::Result<JobSnapshot> {
+    pub async fn transition_status(&self, request_id: Uuid, status: JobStatus, log: Option<String>) -> anyhow::Result<JobSnapshot> {
         {
             let mut jobs = self.inner.jobs.write().await;
             let record = jobs.get_mut(&request_id).context("job not found")?;
@@ -277,7 +271,7 @@ impl AppState {
         self.refresh_snapshot(request_id).await
     }
 
-    async fn set_result(&self, request_id: Uuid, result: serde_json::Value, log: Option<String>) -> anyhow::Result<JobSnapshot> {
+    pub async fn set_result(&self, request_id: Uuid, result: serde_json::Value, log: Option<String>) -> anyhow::Result<JobSnapshot> {
         {
             let mut jobs = self.inner.jobs.write().await;
             let record = jobs.get_mut(&request_id).context("job not found")?;

@@ -13,12 +13,13 @@ dependencies = [
     "python-multipart>=0.0.9",
     "loguru>=0.7",
     "dashscope>=1.14.1",
-    "diffusers>=0.29",
+    "diffusers @ git+https://github.com/huggingface/diffusers.git",
     "accelerate>=0.31",
-    "transformers>=4.40",
+    "transformers>=4.51.3",
     "safetensors>=0.4",
     "Pillow>=10.3",
     "minio>=7.2.0",
+    "redis[hiredis]>=5.0.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,86 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: vyvo-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  orchestrator:
+    image: ghcr.io/hakankozakli/vyvo-orchestrator:latest
+    container_name: vyvo-orchestrator
+    environment:
+      - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  gateway:
+    image: ghcr.io/hakankozakli/vyvo-gateway:latest
+    container_name: vyvo-gateway
+    environment:
+      - GATEWAY_LISTEN_ADDR=:8080
+      - GATEWAY_QUEUE_BASE_URL=http://147.185.41.134:8080
+      - GATEWAY_ORCHESTRATOR_URL=http://orchestrator:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+
+  admin_rest:
+    image: ghcr.io/hakankozakli/vyvo-admin:latest
+    container_name: vyvo-admin
+    environment:
+      - ADMIN_REST_ADDR=:8083
+      - REDIS_URL=redis://redis:6379
+      - ORCHESTRATOR_URL=http://orchestrator:8081
+    ports:
+      - "8083:8083"
+    depends_on:
+      - redis
+      - orchestrator
+    restart: unless-stopped
+
+  # Worker for qwen-image (using existing runner image)
+  worker_qwen_image:
+    image: ghcr.io/hakankozakli/runner-qwen:latest
+    container_name: vyvo-worker-qwen-1
+    command: ["python", "-m", "app.worker"]
+    environment:
+      - WORKER_MODEL_ID=qwen/image
+      - REDIS_URL=redis://redis:6379
+      - WORKER_ID=qwen-worker-1
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=generated-images
+      - QWEN_DIFFUSERS_MODEL=Qwen/Qwen-Image
+      - QWEN_BACKEND=stub
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+      - minio
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+networks:
+  default:
+    name: vyvo
+    external: true

@@ -31,7 +31,8 @@ use crate::state::{
 async fn main() -> anyhow::Result<()> {
     setup_tracing()?;
 
-    let state = AppState::new();
+    let redis_url = std::env::var("REDIS_URL").ok();
+    let state = AppState::new(redis_url)?;
 
     let app = Router::new()
         .route("/healthz", get(healthz))

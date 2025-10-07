@@ -20,8 +20,11 @@ services:
       dockerfile: configs/docker/Dockerfile.orchestrator
     environment:
       - RUST_LOG=info
+      - REDIS_URL=redis://redis:6379
     ports:
       - "8081:8081"
+    depends_on:
+      - redis
 
   workflow_engine:
     build:
@@ -36,8 +39,15 @@ services:
     build:
       context: ../
       dockerfile: configs/docker/Dockerfile.admin
+    environment:
+      - ADMIN_REST_ADDR=:8083
+      - REDIS_URL=redis://redis:6379
+      - ORCHESTRATOR_URL=http://orchestrator:8081
     ports:
       - "8083:8083"
+    depends_on:
+      - redis
+      - orchestrator
 
   webhook_dispatcher:
     build:
@@ -54,6 +64,26 @@ services:
       - PORT=9001
     ports:
       - "9001:9001"
+
+  # Queue-based worker for qwen-image
+  worker_qwen_image:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.runner.qwen
+    command: ["python", "-m", "app.worker"]
+    environment:
+      - WORKER_MODEL_ID=qwen/image
+      - REDIS_URL=redis://redis:6379
+      - WORKER_ID=qwen-worker-1
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=vyvo
+      - MINIO_SECRET_KEY=password
+      - MINIO_BUCKET=generated-images
+      - QWEN_DIFFUSERS_MODEL=Qwen/Qwen-Image
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+      - minio
 
   runner_wan_video:
     build:

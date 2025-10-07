@@ -41,6 +41,8 @@ class InvokeRequest(BaseModel):
     guidance_scale: float | None = Field(default=None, ge=0.0, le=30.0)
     image_count: int = Field(default=1, ge=1, le=4)
     size: str | None = Field(default=None, pattern=r"^\d{3,4}\*\d{3,4}$")
+    width: int | None = Field(default=None, ge=512, le=2048)
+    height: int | None = Field(default=None, ge=512, le=2048)
 
 
 class ImageArtifact(BaseModel):
@@ -207,10 +209,10 @@ class DashScopeBackend(ImageBackend):
 class DiffusersBackend(ImageBackend):
     def __init__(self, settings: ModelSettings, storage: MinIOStorage | None = None) -> None:
         import torch
-        from diffusers import AutoPipelineForText2Image
+        from diffusers import DiffusionPipeline
 
         model_id = os.getenv("QWEN_DIFFUSERS_MODEL", "Qwen/Qwen-Image")
-        torch_dtype_str = os.getenv("QWEN_TORCH_DTYPE", "float16")
+        torch_dtype_str = os.getenv("QWEN_TORCH_DTYPE", "bfloat16")
         device = os.getenv("QWEN_DEVICE", "cuda")
         hf_token = os.getenv("HF_TOKEN")
         trust_remote = os.getenv("QWEN_TRUST_REMOTE_CODE", "1") not in {"0", "false", "False"}
@@ -225,21 +227,15 @@ class DiffusersBackend(ImageBackend):
             trust_remote,
         )
 
-        torch_dtype = getattr(torch, torch_dtype_str, torch.float16)
-        pipeline_kwargs: dict[str, Any] = {
-            "torch_dtype": torch_dtype,
-            "use_safetensors": True,
-            "trust_remote_code": trust_remote,
-        }
-        if torch_dtype == torch.float16:
-            pipeline_kwargs["variant"] = "fp16"
-        if hf_token:
-            pipeline_kwargs["token"] = hf_token
+        torch_dtype = getattr(torch, torch_dtype_str, torch.bfloat16)
 
-        self.pipeline = AutoPipelineForText2Image.from_pretrained(  # type: ignore[arg-type]
+        # Load pipeline following official Qwen-Image documentation
+        # https://github.com/QwenLM/Qwen-Image
+        self.pipeline = DiffusionPipeline.from_pretrained(
             model_id,
-            **pipeline_kwargs,
+            torch_dtype=torch_dtype,
         )
+        self.pipeline = self.pipeline.to(device)
 
         if enable_xformers:
             try:
@@ -248,7 +244,7 @@ class DiffusersBackend(ImageBackend):
             except Exception as exc:  # pragma: no cover - depends on build
                 logger.warning("Failed to enable xFormers: {}", exc)
 
-        if enable_tf32 and torch.backends.cuda.is_available():  # pragma: no cover - hardware dependent
+        if enable_tf32 and torch.cuda.is_available():  # pragma: no cover - hardware dependent
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
@@ -269,13 +265,16 @@ class DiffusersBackend(ImageBackend):
             generator = self.torch.Generator(device=self.device).manual_seed(int(request.seed))
 
         def _run_pipeline() -> Iterable[Any]:
+            # Qwen-Image uses true_cfg_scale instead of guidance_scale
             result = self.pipeline(
                 prompt=prompt,
-                negative_prompt=negative_prompt,
+                negative_prompt=negative_prompt or " ",
                 num_inference_steps=steps,
-                guidance_scale=guidance,
+                true_cfg_scale=guidance,  # Qwen-specific parameter
                 num_images_per_prompt=image_count,
                 generator=generator,
+                width=request.width or 1024,
+                height=request.height or 1024,
             )
             return result.images
 
