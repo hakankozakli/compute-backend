@@ -73,59 +73,52 @@ class QueueWorker:
         job_key = f"job:{job_id}"
 
         try:
-            # Get job data from Redis
-            job_json = await self.redis_client.get(job_key)
-            if not job_json:
+            # Get job data from Redis (stored as hash by admin API)
+            job_data = await self.redis_client.hgetall(job_key)
+            if not job_data:
                 logger.error("Job {} not found in Redis", job_id)
                 return
 
-            job_data = json.loads(job_json)
+            # Convert bytes to strings if needed
+            job_data = {k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
+                       for k, v in job_data.items()}
+
             logger.debug("Processing job {}: {}", job_id, job_data)
 
             # Update job status to processing
-            job_data["status"] = "processing"
-            job_data["worker_id"] = self.worker_id
-            job_data["started_at"] = int(time.time())
-            await self.redis_client.set(job_key, json.dumps(job_data))
+            await self.redis_client.hset(job_key, "status", "processing")
+            await self.redis_client.hset(job_key, "worker_id", self.worker_id)
+            await self.redis_client.hset(job_key, "started_at", str(int(time.time())))
 
             # TODO: Update orchestrator status via HTTP
             # For now, just process the job
 
-            # Convert params to InvokeRequest
-            params = job_data.get("params", {})
+            # Convert params to InvokeRequest (admin stores fields directly in hash)
             request = InvokeRequest(
-                prompt=params.get("prompt", ""),
-                negative_prompt=params.get("negative_prompt"),
-                seed=params.get("seed"),
-                steps=params.get("steps"),
-                guidance_scale=params.get("guidance_scale"),
-                image_count=params.get("image_count", 1),
-                size=params.get("size"),
-                width=params.get("width"),
-                height=params.get("height"),
+                prompt=job_data.get("prompt", ""),
+                negative_prompt=job_data.get("negative_prompt"),
+                seed=int(job_data["seed"]) if job_data.get("seed") else None,
+                steps=int(job_data.get("steps", 20)),
+                guidance_scale=float(job_data.get("guidance", 8.5)),
+                image_count=int(job_data.get("num_images", 1)),
+                size=job_data.get("size"),
+                width=int(job_data["width"]) if job_data.get("width") else None,
+                height=int(job_data["height"]) if job_data.get("height") else None,
             )
 
             # Generate
             result = await self.backend.generate(request)
 
-            # Update job with result
-            job_data["status"] = "completed"
-            job_data["completed_at"] = int(time.time())
-            job_data["result"] = {
-                "request_id": result.request_id,
-                "outputs": [
-                    {
-                        "type": output.type,
-                        "url": output.url,
-                        "mime_type": output.mime_type,
-                        "seed": output.seed,
-                    }
-                    for output in result.outputs
-                ],
-                "inference_seconds": result.inference_seconds,
-            }
+            # Update job with result (store in hash)
+            await self.redis_client.hset(job_key, "status", "completed")
+            await self.redis_client.hset(job_key, "completed_at", str(int(time.time())))
+            await self.redis_client.hset(job_key, "inference_seconds", str(result.inference_seconds))
 
-            await self.redis_client.set(job_key, json.dumps(job_data))
+            # Store image URL if available
+            if result.outputs:
+                image_url = result.outputs[0].url
+                await self.redis_client.hset(job_key, "image_url", image_url)
+
             logger.info(
                 "Job {} completed in {:.2f}s",
                 job_id,
@@ -139,15 +132,11 @@ class QueueWorker:
 
             # Mark job as failed
             try:
-                job_json = await self.redis_client.get(job_key)
-                if job_json:
-                    job_data = json.loads(job_json)
-                    job_data["status"] = "failed"
-                    job_data["completed_at"] = int(time.time())
-                    job_data["error"] = str(exc)
-                    await self.redis_client.set(job_key, json.dumps(job_data))
+                await self.redis_client.hset(job_key, "status", "failed")
+                await self.redis_client.hset(job_key, "error", str(exc))
+                await self.redis_client.hset(job_key, "failed_at", str(int(time.time())))
             except Exception as update_exc:
-                logger.error("Failed to update job status: {}", update_exc)
+                logger.error("Failed to update job {} status: {}", job_id, update_exc)
 
     async def close(self) -> None:
         """Close Redis connection"""
