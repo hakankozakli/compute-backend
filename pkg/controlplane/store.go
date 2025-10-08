@@ -66,6 +66,7 @@ func (s *Store) load() error {
 			continue
 		}
 		n := *pn.Node
+		n.Assignments = append([]ModelAssignment(nil), pn.Node.Assignments...)
 		n.SSHPassword = pn.SSHPassword
 		n.SSHPrivateKey = pn.SSHPrivateKey
 		n.HFToken = pn.HFToken
@@ -89,6 +90,7 @@ func (s *Store) save() error {
 	container := persistContainer{}
 	for _, node := range s.nodes {
 		copyNode := *node
+		copyNode.Assignments = append([]ModelAssignment(nil), node.Assignments...)
 		container.Nodes = append(container.Nodes, &persistedNode{
 			Node:            &copyNode,
 			SSHPassword:     node.SSHPassword,
@@ -225,6 +227,16 @@ func (s *Store) appendEvent(id string, event NodeEvent) {
 	s.mu.Unlock()
 }
 
+func (s *Store) AppendEvent(id string, status NodeStatus, message string) {
+	s.appendEvent(id, NodeEvent{
+		ID:        uuid.NewString(),
+		NodeID:    id,
+		Status:    status,
+		Message:   message,
+		CreatedAt: time.Now().UTC(),
+	})
+}
+
 func (s *Store) Credentials(id string) (username, password string, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -233,6 +245,23 @@ func (s *Store) Credentials(id string) (username, password string, ok bool) {
 		return "", "", false
 	}
 	return node.SSHUsername, node.SSHPassword, true
+}
+
+func (s *Store) UpsertAssignment(id string, assignment ModelAssignment) (*Node, error) {
+	return s.updateNode(id, func(n *Node) error {
+		replaced := false
+		for idx, existing := range n.Assignments {
+			if existing.ModelID == assignment.ModelID {
+				n.Assignments[idx] = assignment
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			n.Assignments = append(n.Assignments, assignment)
+		}
+		return nil
+	})
 }
 
 func (s *Store) UpdateSecrets(id, password, hfToken, dashscope string) error {

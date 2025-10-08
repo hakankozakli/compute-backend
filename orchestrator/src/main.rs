@@ -16,7 +16,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 use crate::state::{
-    self,
     AppState,
     CancelResponse,
     CancelStatus,
@@ -44,12 +43,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/internal/sync", post(sync_invoke))
         .with_state(state);
 
-    let addr: SocketAddr = "0.0.0.0:8081".parse()?;
-    tracing::info!("orchestrator listening", %addr);
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8081".to_string());
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    tracing::info!("orchestrator listening on {}", addr);
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

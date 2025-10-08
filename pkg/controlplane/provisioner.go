@@ -9,13 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
 type Provisioner struct {
-	store      *Store
+	store      Repository
 	scriptBody []byte
 	logger     Logger
 }
@@ -25,7 +24,7 @@ type Logger interface {
 	Error(msg string, args ...any)
 }
 
-func NewProvisioner(store *Store, script []byte, logger Logger) *Provisioner {
+func NewProvisioner(store Repository, script []byte, logger Logger) *Provisioner {
 	return &Provisioner{store: store, scriptBody: script, logger: logger}
 }
 
@@ -119,13 +118,7 @@ func (p *Provisioner) installRunner(ctx context.Context, client *ssh.Client, nod
 		return fmt.Errorf("upload setup script: %w", err)
 	}
 
-	p.store.appendEvent(node.ID, NodeEvent{
-		ID:        uuid.NewString(),
-		NodeID:    node.ID,
-		Status:    NodeStatusProvisioning,
-		Message:   "Writing model configuration",
-		CreatedAt: time.Now().UTC(),
-	})
+	p.store.AppendEvent(node.ID, NodeStatusProvisioning, "Writing model configuration")
 
 	if err := p.writeEnvFile(client, node, sudo); err != nil {
 		return err
@@ -141,13 +134,7 @@ func (p *Provisioner) installRunner(ctx context.Context, client *ssh.Client, nod
 	}
 
 	for _, step := range steps {
-		p.store.appendEvent(node.ID, NodeEvent{
-			ID:        uuid.NewString(),
-			NodeID:    node.ID,
-			Status:    NodeStatusProvisioning,
-			Message:   step.message,
-			CreatedAt: time.Now().UTC(),
-		})
+		p.store.AppendEvent(node.ID, NodeStatusProvisioning, step.message)
 		if _, err := runCommand(ctx, client, step.command); err != nil {
 			return fmt.Errorf("%s: %w", step.message, err)
 		}

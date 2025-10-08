@@ -8,7 +8,7 @@ services:
     environment:
       - GATEWAY_LISTEN_ADDR=:8080
       - GATEWAY_QUEUE_BASE_URL=http://localhost:8080
-      - GATEWAY_ORCHESTRATOR_URL=http://orchestrator:8081
+      - GATEWAY_ORCHESTRATOR_URL=http://orchestrator:8084
     ports:
       - "8080:8080"
     depends_on:
@@ -21,8 +21,9 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://redis:6379
+      - PORT=8084
     ports:
-      - "8081:8081"
+      - "8084:8084"
     depends_on:
       - redis
 
@@ -42,12 +43,28 @@ services:
     environment:
       - ADMIN_REST_ADDR=:8083
       - REDIS_URL=redis://redis:6379
-      - ORCHESTRATOR_URL=http://orchestrator:8081
+      - ORCHESTRATOR_URL=http://orchestrator:8084
+      - ADMIN_REST_DATABASE_URL=postgres://vyvo:vyvo@postgres:5432/vyvo?sslmode=disable
     ports:
       - "8083:8083"
     depends_on:
       - redis
       - orchestrator
+      - postgres
+
+  builder:
+    build:
+      context: ../
+      dockerfile: configs/docker/Dockerfile.builder
+    environment:
+      - BUILDER_ADDR=:8085
+      - BUILDER_DATABASE_URL=postgres://vyvo:vyvo@postgres:5432/vyvo?sslmode=disable
+      - BUILDER_REGISTRY_URL=http://admin_rest:8083
+    ports:
+      - "8085:8085"
+    depends_on:
+      - postgres
+      - admin_rest
 
   webhook_dispatcher:
     build:
@@ -56,64 +73,21 @@ services:
     depends_on:
       - orchestrator
 
-  runner_qwen_image:
-    build:
-      context: ../
-      dockerfile: configs/docker/Dockerfile.runner.qwen
-    environment:
-      - PORT=9001
-    ports:
-      - "9001:9001"
-
-  # Queue-based worker for qwen-image
-  worker_qwen_image:
-    build:
-      context: ../
-      dockerfile: configs/docker/Dockerfile.runner.qwen
-    command: ["python", "-m", "app.worker"]
-    environment:
-      - WORKER_MODEL_ID=qwen/image
-      - REDIS_URL=redis://redis:6379
-      - WORKER_ID=qwen-worker-1
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=vyvo
-      - MINIO_SECRET_KEY=password
-      - MINIO_BUCKET=generated-images
-      - QWEN_DIFFUSERS_MODEL=Qwen/Qwen-Image
-      - LOG_LEVEL=INFO
-    depends_on:
-      - redis
-      - minio
-
-  runner_wan_video:
-    build:
-      context: ../
-      dockerfile: configs/docker/Dockerfile.runner.wan
-    environment:
-      - PORT=9002
-    ports:
-      - "9002:9002"
-
-  runner_video_to_audio:
-    build:
-      context: ../
-      dockerfile: configs/docker/Dockerfile.runner.audio
-    environment:
-      - PORT=9003
-    ports:
-      - "9003:9003"
-
   control_plane:
     build:
       context: ../
       dockerfile: configs/docker/Dockerfile.control-plane
     environment:
-      - CONTROL_PLANE_ADDR=:3001
+      - CONTROL_PLANE_ADDR=:3002
       - CONTROL_PLANE_DATA=/var/lib/vyvo/nodes.json
+      - REDIS_URL=redis://redis:6379
+      - CONTROL_PLANE_DATABASE_URL=postgres://vyvo:vyvo@postgres:5432/vyvo?sslmode=disable
     volumes:
       - control_plane_data:/var/lib/vyvo
     ports:
-      - "3001:3001"
+      - "3002:3002"
+    depends_on:
+      - redis
 
   redis:
     image: redis:7-alpine
@@ -137,7 +111,7 @@ services:
       - MINIO_ROOT_PASSWORD=password
     ports:
       - "9000:9000"
-      - "9001:9001"
+      - "9012:9001"
 
   otel_collector:
     image: otel/opentelemetry-collector:0.99.0

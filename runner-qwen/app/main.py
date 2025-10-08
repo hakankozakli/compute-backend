@@ -99,11 +99,18 @@ class MinIOStorage:
                 len(image_data),
                 content_type="image/png",
             )
-            # Return URL (adjust this based on your MinIO public URL)
-            endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT", os.getenv("MINIO_ENDPOINT", "localhost:9000"))
-            secure = os.getenv("MINIO_SECURE", "false").lower() in ("true", "1", "yes")
-            protocol = "https" if secure else "http"
-            return f"{protocol}://{endpoint}/{self.bucket}/{filename}"
+            # Return URL using MINIO_PUBLIC_URL or construct from MINIO_ENDPOINT
+            public_url = os.getenv("MINIO_PUBLIC_URL")
+            if public_url:
+                # Remove trailing slash if present
+                public_url = public_url.rstrip('/')
+                return f"{public_url}/{self.bucket}/{filename}"
+            else:
+                # Fallback to constructing URL from endpoint
+                endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+                secure = os.getenv("MINIO_SECURE", "false").lower() in ("true", "1", "yes")
+                protocol = "https" if secure else "http"
+                return f"{protocol}://{endpoint}/{self.bucket}/{filename}"
         except S3Error as exc:
             logger.error("Failed to upload image: {}", exc)
             raise HTTPException(status_code=500, detail="Failed to upload image to storage")
@@ -115,17 +122,54 @@ class ImageBackend:
 
 
 class StubBackend(ImageBackend):
+    def __init__(self, storage: MinIOStorage | None = None):
+        self.storage = storage
+
     async def generate(self, request: InvokeRequest) -> BackendResult:
+        from PIL import Image, ImageDraw, ImageFont
+
         start = time.perf_counter()
         request_id = uuid.uuid4().hex
-        await asyncio.sleep(0.05)
-        outputs = [
-            ImageArtifact(
-                url=f"https://cdn.vyvo.local/mock/{request_id}-{idx}.png",
-                seed=(request.seed or 0) + idx,
+
+        # Simulate some processing time
+        await asyncio.sleep(0.5)
+
+        outputs = []
+        for idx in range(request.image_count):
+            # Generate a simple test image with PIL
+            width, height = 512, 512
+
+            # Create image with gradient background
+            img = Image.new('RGB', (width, height), color=(73, 109, 137))
+            d = ImageDraw.Draw(img)
+
+            # Draw some shapes
+            d.rectangle([50, 50, width-50, height-50], fill=(200, 120, 180), outline=(255, 255, 255), width=3)
+            d.ellipse([150, 150, width-150, height-150], fill=(100, 200, 150), outline=(255, 255, 255), width=3)
+
+            # Add text
+            text = f"Stub Image\nRequest: {request_id[:8]}\nPrompt: {request.prompt[:30]}..."
+            d.multiline_text((width//2, height//2), text, fill=(255, 255, 255), anchor="mm")
+
+            # Convert to bytes
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format='PNG')
+            img_data = img_buffer.getvalue()
+
+            # Upload to MinIO if storage is available
+            if self.storage:
+                filename = f"stub/{request_id}-{idx}.png"
+                image_url = self.storage.upload_image(img_data, filename)
+            else:
+                image_url = f"https://cdn.vyvo.local/mock/{request_id}-{idx}.png"
+
+            outputs.append(
+                ImageArtifact(
+                    url=image_url,
+                    seed=(request.seed or 0) + idx,
+                )
             )
-            for idx in range(request.image_count)
-        ]
+
         elapsed = time.perf_counter() - start
         logger.warning(
             "Using stub backend for request_id={} (no real backend configured)",
@@ -229,13 +273,14 @@ class DiffusersBackend(ImageBackend):
 
         torch_dtype = getattr(torch, torch_dtype_str, torch.bfloat16)
 
-        # Load pipeline following official Qwen-Image documentation
-        # https://github.com/QwenLM/Qwen-Image
+        # Load diffusion pipeline
+        # FLUX.1-dev: ~24GB VRAM (recommended for 80GB GPU)
+        # Qwen/Qwen-Image: ~72GB VRAM (too large for single 80GB GPU)
+        self.model_id = model_id
         self.pipeline = DiffusionPipeline.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
-        )
-        self.pipeline = self.pipeline.to(device)
+        ).to(device)
 
         if enable_xformers:
             try:
@@ -247,8 +292,6 @@ class DiffusersBackend(ImageBackend):
         if enable_tf32 and torch.cuda.is_available():  # pragma: no cover - hardware dependent
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-
-        self.pipeline.to(device)
         self.device = device
         self.settings = settings
         self.torch = torch
@@ -265,17 +308,26 @@ class DiffusersBackend(ImageBackend):
             generator = self.torch.Generator(device=self.device).manual_seed(int(request.seed))
 
         def _run_pipeline() -> Iterable[Any]:
-            # Qwen-Image uses true_cfg_scale instead of guidance_scale
-            result = self.pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt or " ",
-                num_inference_steps=steps,
-                true_cfg_scale=guidance,  # Qwen-specific parameter
-                num_images_per_prompt=image_count,
-                generator=generator,
-                width=request.width or 1024,
-                height=request.height or 1024,
-            )
+            # Different models use different parameter names for guidance
+            pipeline_kwargs = {
+                "prompt": prompt,
+                "num_inference_steps": steps,
+                "num_images_per_prompt": image_count,
+                "generator": generator,
+                "width": request.width or 1024,
+                "height": request.height or 1024,
+            }
+
+            # Qwen-Image uses true_cfg_scale, others use guidance_scale
+            if "Qwen" in self.model_id:
+                pipeline_kwargs["true_cfg_scale"] = guidance
+                pipeline_kwargs["negative_prompt"] = negative_prompt or " "
+            else:
+                pipeline_kwargs["guidance_scale"] = guidance
+                if negative_prompt:
+                    pipeline_kwargs["negative_prompt"] = negative_prompt
+
+            result = self.pipeline(**pipeline_kwargs)
             return result.images
 
         start = time.perf_counter()
@@ -335,7 +387,7 @@ def build_backend(settings: ModelSettings) -> ImageBackend:
             logger.exception("Failed to initialize DashScope backend: {}", exc)
 
     logger.info("Using stub backend (no real backend configured)")
-    return StubBackend()
+    return StubBackend(storage=storage)
 
 
 app = FastAPI(title="Vyvo Qwen Image Runner", version="0.4.0")

@@ -7,12 +7,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/vyvo/compute/backend/pkg/modelregistry"
 	"github.com/vyvo/compute/backend/pkg/orchestrator"
 	"github.com/vyvo/compute/backend/pkg/queue"
 )
@@ -21,6 +23,7 @@ type server struct {
 	redisClient  *redis.Client
 	orchestrator *orchestrator.Client
 	queueManager *queue.Queue
+	modelStore   modelregistry.Store
 }
 
 // Queue monitoring responses
@@ -92,10 +95,39 @@ func main() {
 	// Create orchestrator client
 	orchestratorClient := orchestrator.NewClient(orchestratorURL)
 
+	var (
+		modelStore  modelregistry.Store
+		storeCloser func()
+	)
+
+	if dbURL := strings.TrimSpace(os.Getenv("ADMIN_REST_DATABASE_URL")); dbURL != "" {
+		pgStore, err := modelregistry.NewPostgresStore(dbURL)
+		if err != nil {
+			log.Fatalf("initialise model store: %v", err)
+		}
+		if err := pgStore.EnsureSchema(); err != nil {
+			log.Fatalf("apply model migrations: %v", err)
+		}
+		modelStore = pgStore
+		storeCloser = func() {
+			if err := pgStore.Close(); err != nil {
+				log.Printf("model store close error: %v", err)
+			}
+		}
+		log.Println("model registry store initialised")
+	} else {
+		log.Println("ADMIN_REST_DATABASE_URL not set; model registry endpoints disabled")
+	}
+
+	if storeCloser != nil {
+		defer storeCloser()
+	}
+
 	srv := &server{
 		redisClient:  redisClient,
 		orchestrator: orchestratorClient,
 		queueManager: queueManager,
+		modelStore:   modelStore,
 	}
 
 	r := chi.NewRouter()
@@ -134,6 +166,18 @@ func main() {
 		r.Route("/system", func(r chi.Router) {
 			r.Post("/wipe", srv.handleWipeAll)
 		})
+
+		if srv.modelStore != nil {
+			r.Route("/models", func(r chi.Router) {
+				r.Get("/", srv.handleListModels)
+				r.Post("/", srv.handleCreateModel)
+				r.Route("/{modelID}", func(r chi.Router) {
+					r.Get("/", srv.handleGetModel)
+					r.Post("/versions", srv.handleCreateVersion)
+					r.Post("/promote", srv.handlePromoteVersion)
+				})
+			})
+		}
 	})
 
 	log.Printf("admin REST listening on %s", listenAddr)
@@ -426,6 +470,143 @@ func (s *server) handleWipeAll(w http.ResponseWriter, r *http.Request) {
 		"message": "wiped all queues and jobs",
 		"deleted": len(allKeys),
 	}, http.StatusOK)
+}
+
+// Model registry
+func (s *server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	var opts modelregistry.QueryOptions
+	if families := r.URL.Query()["family"]; len(families) > 0 {
+		opts.Family = families
+	}
+	if statuses := r.URL.Query()["status"]; len(statuses) > 0 {
+		opts.Status = statuses
+	}
+
+	models, err := s.modelStore.ListModels(opts)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("list models: %v", err))
+		return
+	}
+
+	respondJSON(w, map[string]any{"models": models}, http.StatusOK)
+}
+
+func (s *server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	var req createModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+
+	model, err := s.modelStore.CreateModel(req.Model)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if req.Version != nil {
+		version, err := s.modelStore.CreateVersion(model.ID, *req.Version)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.PromoteVersion {
+			if err := s.modelStore.PromoteVersion(model.ID, version.ID); err != nil {
+				respondError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			model.DefaultVersionID = &version.ID
+			model.LatestVersion = &modelregistry.ModelVersionInfo{
+				ID:          version.ID,
+				Version:     version.Version,
+				Status:      version.Status,
+				RunnerImage: version.RunnerImage,
+				CreatedAt:   version.CreatedAt,
+				UpdatedAt:   version.UpdatedAt,
+			}
+			model.Status = modelregistry.StatusReady
+		}
+	}
+
+	respondJSON(w, map[string]any{"model": model}, http.StatusCreated)
+}
+
+func (s *server) handleGetModel(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	id := chi.URLParam(r, "modelID")
+	model, err := s.modelStore.GetModel(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	respondJSON(w, map[string]any{"model": model}, http.StatusOK)
+}
+
+func (s *server) handleCreateVersion(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	id := chi.URLParam(r, "modelID")
+	var req modelregistry.CreateVersionInput
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+	version, err := s.modelStore.CreateVersion(id, req)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	respondJSON(w, map[string]any{"version": version}, http.StatusCreated)
+}
+
+func (s *server) handlePromoteVersion(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	id := chi.URLParam(r, "modelID")
+	var req promoteVersionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+	if strings.TrimSpace(req.VersionID) == "" {
+		respondError(w, http.StatusBadRequest, "version_id is required")
+		return
+	}
+	if err := s.modelStore.PromoteVersion(id, req.VersionID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	respondJSON(w, map[string]string{"status": "promoted"}, http.StatusAccepted)
+}
+
+type createModelRequest struct {
+	Model          modelregistry.CreateModelInput    `json:"model"`
+	Version        *modelregistry.CreateVersionInput `json:"version,omitempty"`
+	PromoteVersion bool                              `json:"promote_version"`
+}
+
+type promoteVersionRequest struct {
+	VersionID string `json:"version_id"`
 }
 
 // Helper functions

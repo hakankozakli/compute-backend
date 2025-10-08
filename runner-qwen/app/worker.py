@@ -152,7 +152,8 @@ async def main() -> None:
     worker_id = os.getenv("WORKER_ID", f"worker-{os.getpid()}")
 
     logger.remove()
-    logger.add(lambda msg: print(msg, end=""), level=os.getenv("LOG_LEVEL", "INFO"))
+    import sys
+    logger.add(sys.stdout, level=os.getenv("LOG_LEVEL", "INFO"))
 
     logger.info(
         "Starting worker model_id={} worker_id={} redis={}",

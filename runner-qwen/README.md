@@ -34,6 +34,10 @@ export HF_TOKEN=<your-hf-token-if-required>
 uvicorn app.main:app --reload --port 9001
 ```
 
+> Tip: To scaffold a new runner, start from the reusable template under `backend/runners/template`
+> or run `./scripts/new-runner.sh <name> <model-id>`. It generates the FastAPI app, queue worker,
+> Dockerfile, and Makefile so you can focus on model-specific code.
+
 Smoke test:
 
 ```bash

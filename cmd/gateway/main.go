@@ -209,7 +209,7 @@ func (s *server) handleMutations(w http.ResponseWriter, r *http.Request) {
     }
 
     path := strings.Trim(r.URL.Path, "/")
-    modelPath, requestID, suffix, ok := splitRequestPath(path)
+    _, requestID, suffix, ok := splitRequestPath(path)
     if !ok || suffix != "cancel" {
         http.NotFound(w, r)
         return

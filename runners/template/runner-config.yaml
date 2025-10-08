@@ -1,0 +1,13 @@
+model_id: template/model
+backend: stub
+weights:
+  uri: s3://vyvo-models/template-model
+  checksum: ""
+resources:
+  gpu_memory_gb: 24
+  max_batch_size: 1
+environment:
+  - name: RUNNER_BACKEND
+    value: stub
+  - name: VYVO_MODEL_ID
+    value: template/model
