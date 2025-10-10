@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,
     queue_position INT,
     payload JSONB,
-    artifacts JSONB,
+    result JSONB,
+    logs JSONB DEFAULT '[]'::jsonb,
+    artifacts JSONB DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

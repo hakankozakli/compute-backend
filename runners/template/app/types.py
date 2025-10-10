@@ -12,7 +12,7 @@ class InvokeRequest(BaseModel):
 
 class Artifact(BaseModel):
     type: str = Field(default="artifact")
-    url: str
+    url: str | None = None
     mime_type: str = Field(default="application/json")
     metadata: dict[str, Any] = Field(default_factory=dict)
 

@@ -17,6 +17,7 @@ type Node struct {
 	ID                string            `json:"id"`
 	Name              string            `json:"name"`
 	GPUType           string            `json:"gpuType"`
+	TotalVRAMGB       int               `json:"totalVramGb"`
 	IPAddress         string            `json:"ipAddress"`
 	SSHUsername       string            `json:"sshUsername"`
 	SSHPassword       string            `json:"-"`
@@ -52,6 +53,7 @@ type SanitizedNode struct {
 	ID                string            `json:"id"`
 	Name              string            `json:"name"`
 	GPUType           string            `json:"gpuType"`
+	TotalVRAMGB       int               `json:"totalVramGb"`
 	IPAddress         string            `json:"ipAddress"`
 	SSHUsername       string            `json:"sshUsername"`
 	SSHPort           int               `json:"sshPort"`
@@ -75,6 +77,7 @@ func (n *Node) Sanitized() SanitizedNode {
 		ID:                n.ID,
 		Name:              n.Name,
 		GPUType:           n.GPUType,
+		TotalVRAMGB:       n.TotalVRAMGB,
 		IPAddress:         n.IPAddress,
 		SSHUsername:       n.SSHUsername,
 		SSHPort:           n.SSHPort,

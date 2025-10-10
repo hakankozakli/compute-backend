@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Protocol
 
 from loguru import logger
@@ -21,8 +22,12 @@ class StubBackend:
 
     async def generate(self, request: InvokeRequest) -> tuple[list[Artifact], float]:
         artifact = Artifact(
-            url=f"https://cdn.vyvo.local/mock/{self.model_id}/{request.prompt[:32].strip().replace(' ', '_')}.json",
-            metadata={"prompt": request.prompt, "params": request.params},
+            mime_type="application/json",
+            metadata={
+                "prompt": request.prompt,
+                "params": request.params,
+                "generated_at": time.time(),
+            },
         )
         return [artifact], 0.1
 

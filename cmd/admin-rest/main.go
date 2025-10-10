@@ -2,28 +2,98 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/vyvo/compute/backend/pkg/modelregistry"
 	"github.com/vyvo/compute/backend/pkg/orchestrator"
-	"github.com/vyvo/compute/backend/pkg/queue"
 )
 
 type server struct {
 	redisClient  *redis.Client
 	orchestrator *orchestrator.Client
-	queueManager *queue.Queue
 	modelStore   modelregistry.Store
+	jobDB        *sql.DB
+	jobStoreMu   sync.Mutex
+}
+
+const jobStoreSchema = `
+CREATE TABLE IF NOT EXISTS jobs (
+    id UUID PRIMARY KEY,
+    model_id TEXT NOT NULL,
+    version_id TEXT,
+    node_id TEXT,
+    status TEXT NOT NULL,
+    queue_position INT,
+    payload JSONB,
+    result JSONB,
+    logs JSONB DEFAULT '[]'::jsonb,
+    artifacts JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs (status);
+
+CREATE TABLE IF NOT EXISTS job_events (
+    id BIGSERIAL PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS job_events_job_id_idx ON job_events (job_id);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS queue_position INT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS logs JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS artifacts JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE job_events ADD COLUMN IF NOT EXISTS message TEXT;
+ALTER TABLE job_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+`
+
+func ensureJobStore(db *sql.DB) error {
+	statements := strings.Split(jobStoreSchema, ";")
+	for _, stmt := range statements {
+		trimmed := strings.TrimSpace(stmt)
+		if trimmed == "" {
+			continue
+		}
+		if _, err := db.Exec(trimmed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *server) ensureJobStoreReady() error {
+	if s.jobDB == nil {
+		return fmt.Errorf("job store not configured")
+	}
+
+	s.jobStoreMu.Lock()
+	defer s.jobStoreMu.Unlock()
+
+	return ensureJobStore(s.jobDB)
 }
 
 // Queue monitoring responses
@@ -45,6 +115,61 @@ type jobSummary struct {
 	Status    string `json:"status"`
 	CreatedAt int64  `json:"created_at,omitempty"`
 	WorkerID  string `json:"worker_id,omitempty"`
+	QueuePos  *int   `json:"queue_position,omitempty"`
+	UpdatedAt int64  `json:"updated_at,omitempty"`
+}
+
+type jobDetail struct {
+	ID            string            `json:"id"`
+	ModelID       string            `json:"model_id"`
+	VersionID     *string           `json:"version_id,omitempty"`
+	NodeID        *string           `json:"node_id,omitempty"`
+	Status        string            `json:"status"`
+	QueuePosition *int              `json:"queue_position,omitempty"`
+	Payload       json.RawMessage   `json:"payload,omitempty"`
+	Result        json.RawMessage   `json:"result,omitempty"`
+	Logs          []string          `json:"logs"`
+	Artifacts     []json.RawMessage `json:"artifacts"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	Events        []jobEvent        `json:"events"`
+}
+
+type jobEvent struct {
+	Status    string    `json:"status"`
+	Message   *string   `json:"message,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type importModelRequest struct {
+	HuggingFaceID string `json:"huggingface_id"`
+	RunnerImage   string `json:"runner_image"`
+	Version       string `json:"version,omitempty"`
+	WeightsFile   string `json:"weights_file,omitempty"`
+	Promote       *bool  `json:"promote_version,omitempty"`
+}
+
+type importModelResponse struct {
+	Model   modelregistry.Model        `json:"model"`
+	Version modelregistry.ModelVersion `json:"version"`
+}
+
+type huggingFaceModel struct {
+	ModelID      string                 `json:"modelId"`
+	PipelineTag  string                 `json:"pipeline_tag"`
+	Tags         []string               `json:"tags"`
+	CardData     map[string]any         `json:"cardData"`
+	Siblings     []huggingFaceModelFile `json:"siblings"`
+	LibraryName  string                 `json:"library_name"`
+	Description  string                 `json:"description"`
+	Likes        int                    `json:"likes"`
+	Downloads    int                    `json:"downloads"`
+	LastModified string                 `json:"lastModified"`
+}
+
+type huggingFaceModelFile struct {
+	RFilename string `json:"rfilename"`
+	Size      int64  `json:"size"`
 }
 
 type jobsResponse struct {
@@ -86,21 +211,17 @@ func main() {
 		log.Println("Connected to Redis")
 	}
 
-	// Create queue manager
-	queueManager, err := queue.NewQueue(redisURL)
-	if err != nil {
-		log.Fatalf("failed to create queue manager: %v", err)
-	}
-
 	// Create orchestrator client
 	orchestratorClient := orchestrator.NewClient(orchestratorURL)
 
 	var (
 		modelStore  modelregistry.Store
 		storeCloser func()
+		jobDB       *sql.DB
 	)
 
-	if dbURL := strings.TrimSpace(os.Getenv("ADMIN_REST_DATABASE_URL")); dbURL != "" {
+	dbURL := strings.TrimSpace(os.Getenv("ADMIN_REST_DATABASE_URL"))
+	if dbURL != "" {
 		pgStore, err := modelregistry.NewPostgresStore(dbURL)
 		if err != nil {
 			log.Fatalf("initialise model store: %v", err)
@@ -115,6 +236,19 @@ func main() {
 			}
 		}
 		log.Println("model registry store initialised")
+		jobDB, err = sql.Open("pgx", dbURL)
+		if err != nil {
+			log.Fatalf("connect job database: %v", err)
+		}
+		jobDB.SetMaxIdleConns(5)
+		jobDB.SetMaxOpenConns(15)
+		jobDB.SetConnMaxLifetime(30 * time.Minute)
+		if err := jobDB.Ping(); err != nil {
+			log.Fatalf("job database ping failed: %v", err)
+		}
+		if err := ensureJobStore(jobDB); err != nil {
+			log.Fatalf("apply job store schema: %v", err)
+		}
 	} else {
 		log.Println("ADMIN_REST_DATABASE_URL not set; model registry endpoints disabled")
 	}
@@ -122,12 +256,19 @@ func main() {
 	if storeCloser != nil {
 		defer storeCloser()
 	}
+	if jobDB != nil {
+		defer func() {
+			if err := jobDB.Close(); err != nil {
+				log.Printf("job database close error: %v", err)
+			}
+		}()
+	}
 
 	srv := &server{
 		redisClient:  redisClient,
 		orchestrator: orchestratorClient,
-		queueManager: queueManager,
 		modelStore:   modelStore,
+		jobDB:        jobDB,
 	}
 
 	r := chi.NewRouter()
@@ -171,10 +312,13 @@ func main() {
 			r.Route("/models", func(r chi.Router) {
 				r.Get("/", srv.handleListModels)
 				r.Post("/", srv.handleCreateModel)
+				r.Post("/import", srv.handleImportHuggingFaceModel)
+				r.Get("/import/preview", srv.handlePreviewHuggingFaceModel)
 				r.Route("/{modelID}", func(r chi.Router) {
 					r.Get("/", srv.handleGetModel)
 					r.Post("/versions", srv.handleCreateVersion)
 					r.Post("/promote", srv.handlePromoteVersion)
+					r.Patch("/versions/{versionID}/runner", srv.handleUpdateVersionRunner)
 				})
 			})
 		}
@@ -286,125 +430,272 @@ func (s *server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
 
 // Job management
 func (s *server) handleListJobs(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Get all job keys from Redis
-	keys, err := s.redisClient.Keys(ctx, "job:*").Result()
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list jobs: %v", err))
+	if s.jobDB == nil {
+		respondError(w, http.StatusServiceUnavailable, "job store not configured")
 		return
 	}
 
-	jobs := make([]jobSummary, 0, len(keys))
-	for _, key := range keys {
-		jobID := key[4:] // Remove "job:" prefix
+	if err := s.ensureJobStoreReady(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
+		return
+	}
 
-		// Get job data
-		jobData, err := s.redisClient.Get(ctx, key).Result()
-		if err != nil {
-			log.Printf("failed to get job %s: %v", jobID, err)
+	ctx := r.Context()
+	limit := 100
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 500 {
+			limit = parsed
+		}
+	}
+
+	rows, err := s.jobDB.QueryContext(ctx, `
+		SELECT id, model_id, version_id, node_id, status, queue_position, created_at, updated_at
+		FROM jobs
+		ORDER BY created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("query jobs: %v", err))
+		return
+	}
+	defer rows.Close()
+
+	jobs := make([]jobSummary, 0, limit)
+	for rows.Next() {
+		var (
+			id        string
+			modelID   string
+			versionID sql.NullString
+			nodeID    sql.NullString
+			status    string
+			queuePos  sql.NullInt32
+			createdAt time.Time
+			updatedAt time.Time
+		)
+		if err := rows.Scan(&id, &modelID, &versionID, &nodeID, &status, &queuePos, &createdAt, &updatedAt); err != nil {
+			log.Printf("scan job row: %v", err)
 			continue
 		}
-
-		var job map[string]any
-		if err := json.Unmarshal([]byte(jobData), &job); err != nil {
-			log.Printf("failed to unmarshal job %s: %v", jobID, err)
-			continue
-		}
-
 		summary := jobSummary{
-			RequestID: jobID,
-			Status:    getString(job, "status"),
-			ModelID:   getString(job, "model"),
-			WorkerID:  getString(job, "worker_id"),
+			RequestID: id,
+			ModelID:   modelID,
+			Status:    status,
+			CreatedAt: createdAt.Unix(),
+			UpdatedAt: updatedAt.Unix(),
 		}
-
-		if createdAt, ok := job["created_at"].(float64); ok {
-			summary.CreatedAt = int64(createdAt)
+		if nodeID.Valid {
+			summary.WorkerID = nodeID.String
 		}
-
+		if queuePos.Valid {
+			qp := int(queuePos.Int32)
+			summary.QueuePos = &qp
+		}
 		jobs = append(jobs, summary)
 	}
 
-	respondJSON(w, jobsResponse{
-		Jobs:  jobs,
-		Total: len(jobs),
-	}, http.StatusOK)
+	if err := rows.Err(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("iterate jobs: %v", err))
+		return
+	}
+
+	respondJSON(w, jobsResponse{Jobs: jobs, Total: len(jobs)}, http.StatusOK)
 }
 
 func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	if s.jobDB == nil {
+		respondError(w, http.StatusServiceUnavailable, "job store not configured")
+		return
+	}
+
+	if err := s.ensureJobStoreReady(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
+		return
+	}
+
 	jobID := chi.URLParam(r, "jobID")
 	ctx := r.Context()
 
-	// Get from Redis first
-	jobKey := fmt.Sprintf("job:%s", jobID)
-	jobData, err := s.redisClient.Get(ctx, jobKey).Result()
-	if err == redis.Nil {
-		// Try orchestrator
+	var (
+		id             string
+		modelID        string
+		versionID      sql.NullString
+		nodeID         sql.NullString
+		status         string
+		queuePosition  sql.NullInt32
+		payloadBytes   []byte
+		resultBytes    []byte
+		logsBytes      []byte
+		artifactsBytes []byte
+		createdAt      time.Time
+		updatedAt      time.Time
+	)
+
+	err := s.jobDB.QueryRowContext(ctx, `
+		SELECT id, model_id, version_id, node_id, status, queue_position, payload, result, logs, artifacts, created_at, updated_at
+		FROM jobs
+		WHERE id = $1
+	`, jobID).Scan(
+		&id,
+		&modelID,
+		&versionID,
+		&nodeID,
+		&status,
+		&queuePosition,
+		&payloadBytes,
+		&resultBytes,
+		&logsBytes,
+		&artifactsBytes,
+		&createdAt,
+		&updatedAt,
+	)
+	if err == sql.ErrNoRows {
 		respondError(w, http.StatusNotFound, "job not found")
 		return
 	} else if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get job: %v", err))
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("query job: %v", err))
 		return
 	}
 
-	var job map[string]any
-	if err := json.Unmarshal([]byte(jobData), &job); err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to unmarshal job: %v", err))
+	detail := jobDetail{
+		ID:        id,
+		ModelID:   modelID,
+		Status:    status,
+		Logs:      []string{},
+		Artifacts: []json.RawMessage{},
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
+	}
+	if versionID.Valid {
+		detail.VersionID = &versionID.String
+	}
+	if nodeID.Valid {
+		detail.NodeID = &nodeID.String
+	}
+	if queuePosition.Valid {
+		qp := int(queuePosition.Int32)
+		detail.QueuePosition = &qp
+	}
+	if len(payloadBytes) > 0 {
+		detail.Payload = json.RawMessage(payloadBytes)
+	}
+	if len(resultBytes) > 0 {
+		detail.Result = json.RawMessage(resultBytes)
+	}
+	if len(logsBytes) > 0 {
+		var logs []string
+		if err := json.Unmarshal(logsBytes, &logs); err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("decode logs: %v", err))
+			return
+		}
+		detail.Logs = logs
+	}
+	if len(artifactsBytes) > 0 {
+		var artifacts []json.RawMessage
+		if err := json.Unmarshal(artifactsBytes, &artifacts); err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("decode artifacts: %v", err))
+			return
+		}
+		detail.Artifacts = artifacts
+	}
+
+	eventRows, err := s.jobDB.QueryContext(ctx, `
+		SELECT status, message, created_at
+		FROM job_events
+		WHERE job_id = $1
+		ORDER BY created_at ASC
+	`, jobID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("query job events: %v", err))
+		return
+	}
+	defer eventRows.Close()
+
+	for eventRows.Next() {
+		var (
+			eventStatus string
+			message     sql.NullString
+			eventTime   time.Time
+		)
+		if err := eventRows.Scan(&eventStatus, &message, &eventTime); err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("scan job event: %v", err))
+			return
+		}
+		evt := jobEvent{Status: eventStatus, CreatedAt: eventTime}
+		if message.Valid {
+			evt.Message = &message.String
+		}
+		detail.Events = append(detail.Events, evt)
+	}
+
+	if err := eventRows.Err(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("iterate job events: %v", err))
 		return
 	}
 
-	respondJSON(w, job, http.StatusOK)
+	respondJSON(w, detail, http.StatusOK)
 }
 
 func (s *server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
+	if s.jobDB == nil {
+		respondError(w, http.StatusServiceUnavailable, "job store not configured")
+		return
+	}
+
+	if err := s.ensureJobStoreReady(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
+		return
+	}
+
 	jobID := chi.URLParam(r, "jobID")
 	ctx := r.Context()
 
-	jobKey := fmt.Sprintf("job:%s", jobID)
-	deleted, err := s.redisClient.Del(ctx, jobKey).Result()
+	res, err := s.jobDB.ExecContext(ctx, `DELETE FROM jobs WHERE id = $1`, jobID)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to delete job: %v", err))
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("delete job: %v", err))
 		return
 	}
-
-	if deleted == 0 {
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("inspect delete result: %v", err))
+		return
+	}
+	if rowsAffected == 0 {
 		respondError(w, http.StatusNotFound, "job not found")
-		return
-	}
-
-	respondJSON(w, map[string]string{
-		"message": fmt.Sprintf("deleted job %s", jobID),
-	}, http.StatusOK)
-}
-
-func (s *server) handleClearAllJobs(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Get all job keys
-	keys, err := s.redisClient.Keys(ctx, "job:*").Result()
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list jobs: %v", err))
-		return
-	}
-
-	if len(keys) == 0 {
-		respondJSON(w, map[string]any{
-			"message": "no jobs to clear",
-			"deleted": 0,
-		}, http.StatusOK)
-		return
-	}
-
-	deleted, err := s.redisClient.Del(ctx, keys...).Result()
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to delete jobs: %v", err))
 		return
 	}
 
 	respondJSON(w, map[string]any{
-		"message": fmt.Sprintf("cleared %d jobs", deleted),
-		"deleted": deleted,
+		"message": fmt.Sprintf("deleted job %s", jobID),
+		"deleted": rowsAffected,
+	}, http.StatusOK)
+}
+
+func (s *server) handleClearAllJobs(w http.ResponseWriter, r *http.Request) {
+	if s.jobDB == nil {
+		respondError(w, http.StatusServiceUnavailable, "job store not configured")
+		return
+	}
+
+	if err := s.ensureJobStoreReady(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
+		return
+	}
+
+	ctx := r.Context()
+	res, err := s.jobDB.ExecContext(ctx, `DELETE FROM jobs`)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("clear jobs: %v", err))
+		return
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("inspect clear result: %v", err))
+		return
+	}
+
+	respondJSON(w, map[string]any{
+		"message": fmt.Sprintf("cleared %d jobs", rowsAffected),
+		"deleted": rowsAffected,
 	}, http.StatusOK)
 }
 
@@ -541,6 +832,176 @@ func (s *server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]any{"model": model}, http.StatusCreated)
 }
 
+func (s *server) handleImportHuggingFaceModel(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	var req importModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+
+	hfID := strings.TrimSpace(req.HuggingFaceID)
+	if hfID == "" {
+		respondError(w, http.StatusBadRequest, "huggingface_id is required")
+		return
+	}
+	runnerImage := strings.TrimSpace(req.RunnerImage)
+	if runnerImage == "" {
+		respondError(w, http.StatusBadRequest, "runner_image is required")
+		return
+	}
+
+	ctx := r.Context()
+	hfModel, err := fetchHuggingFaceModel(ctx, hfID)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, fmt.Sprintf("fetch huggingface model: %v", err))
+		return
+	}
+
+	displayName := hfModel.ModelID
+	if displayName == "" {
+		displayName = hfID
+	}
+
+	description := firstNonEmpty(
+		hfModel.Description,
+		stringFromCardData(hfModel.CardData, "summary"),
+		stringFromCardData(hfModel.CardData, "description"),
+	)
+	if description == "" {
+		description = fmt.Sprintf("Imported from Hugging Face model %s", hfID)
+	}
+
+	family := hfModel.PipelineTag
+	if family == "" {
+		family = "general"
+	}
+
+	metadata := map[string]any{
+		"huggingface_id": hfID,
+		"pipeline_tag":   hfModel.PipelineTag,
+		"library_name":   hfModel.LibraryName,
+		"card_data":      hfModel.CardData,
+		"likes":          hfModel.Likes,
+		"downloads":      hfModel.Downloads,
+		"last_modified":  hfModel.LastModified,
+	}
+
+	tags := make([]string, 0, len(hfModel.Tags))
+	for _, tag := range hfModel.Tags {
+		if trimmed := strings.TrimSpace(tag); trimmed != "" {
+			tags = append(tags, trimmed)
+		}
+	}
+
+	model, err := s.modelStore.CreateModel(modelregistry.CreateModelInput{
+		ExternalID:  hfID,
+		DisplayName: displayName,
+		Family:      family,
+		Description: description,
+		Metadata: map[string]any{
+			"huggingface": metadata,
+			"tags":        tags,
+		},
+	})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	versionName := strings.TrimSpace(req.Version)
+	if versionName == "" {
+		if hfModel.LastModified != "" {
+			versionName = hfModel.LastModified
+		} else {
+			versionName = "imported"
+		}
+	}
+
+	weightsURL := buildWeightsURL(hfID, req.WeightsFile, hfModel.Siblings)
+	var weightsPtr *string
+	if weightsURL != "" {
+		weightsPtr = &weightsURL
+	}
+
+	parameters := map[string]any{
+		"source":         "huggingface",
+		"huggingface_id": hfID,
+	}
+	if hfModel.PipelineTag != "" {
+		parameters["pipeline_tag"] = hfModel.PipelineTag
+	}
+	if hfModel.LibraryName != "" {
+		parameters["library_name"] = hfModel.LibraryName
+	}
+
+	version, err := s.modelStore.CreateVersion(model.ID, modelregistry.CreateVersionInput{
+		Version:      versionName,
+		RunnerImage:  runnerImage,
+		WeightsURI:   weightsPtr,
+		Parameters:   parameters,
+		Capabilities: deriveCapabilities(hfModel.PipelineTag, tags),
+		Status:       modelregistry.StatusReady,
+	})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	promote := true
+	if req.Promote != nil {
+		promote = *req.Promote
+	}
+	if promote {
+		if err := s.modelStore.PromoteVersion(model.ID, version.ID); err != nil {
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		model.DefaultVersionID = &version.ID
+	}
+
+	respondJSON(w, importModelResponse{Model: model, Version: version}, http.StatusCreated)
+}
+
+func (s *server) handlePreviewHuggingFaceModel(w http.ResponseWriter, r *http.Request) {
+	hfID := strings.TrimSpace(r.URL.Query().Get("huggingface_id"))
+	if hfID == "" {
+		respondError(w, http.StatusBadRequest, "huggingface_id is required")
+		return
+	}
+
+	hfModel, err := fetchHuggingFaceModel(r.Context(), hfID)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, fmt.Sprintf("fetch huggingface model: %v", err))
+		return
+	}
+
+	preview := map[string]any{
+		"model_id":     hfModel.ModelID,
+		"display_name": hfModel.ModelID,
+		"description":  firstNonEmpty(hfModel.Description, stringFromCardData(hfModel.CardData, "summary")),
+		"pipeline_tag": hfModel.PipelineTag,
+		"library_name": hfModel.LibraryName,
+		"tags":         hfModel.Tags,
+		"suggested_version": func() string {
+			if hfModel.LastModified != "" {
+				return hfModel.LastModified
+			}
+			return "imported"
+		}(),
+		"suggested_weights": buildWeightsURL(hfID, "", hfModel.Siblings),
+		"last_modified":     hfModel.LastModified,
+		"downloads":         hfModel.Downloads,
+		"likes":             hfModel.Likes,
+	}
+
+	respondJSON(w, preview, http.StatusOK)
+}
+
 func (s *server) handleGetModel(w http.ResponseWriter, r *http.Request) {
 	if s.modelStore == nil {
 		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
@@ -599,6 +1060,27 @@ func (s *server) handlePromoteVersion(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]string{"status": "promoted"}, http.StatusAccepted)
 }
 
+func (s *server) handleUpdateVersionRunner(w http.ResponseWriter, r *http.Request) {
+	if s.modelStore == nil {
+		respondError(w, http.StatusServiceUnavailable, "model registry not configured")
+		return
+	}
+
+	modelID := chi.URLParam(r, "modelID")
+	versionID := chi.URLParam(r, "versionID")
+	var req modelregistry.UpdateRunnerConfigInput
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+	version, err := s.modelStore.UpdateVersionRunnerConfig(modelID, versionID, req)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	respondJSON(w, map[string]any{"version": version}, http.StatusOK)
+}
+
 type createModelRequest struct {
 	Model          modelregistry.CreateModelInput    `json:"model"`
 	Version        *modelregistry.CreateVersionInput `json:"version,omitempty"`
@@ -638,7 +1120,11 @@ func envOrDefault(key, fallback string) string {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
 		if r.Method == http.MethodOptions {
@@ -647,4 +1133,100 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func fetchHuggingFaceModel(ctx context.Context, modelID string) (*huggingFaceModel, error) {
+	url := fmt.Sprintf("https://huggingface.co/api/models/%s", modelID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("model %s not found on Hugging Face", modelID)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("huggingface API error (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload huggingFaceModel
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if payload.ModelID == "" {
+		payload.ModelID = modelID
+	}
+	return &payload, nil
+}
+
+func stringFromCardData(cardData map[string]any, key string) string {
+	if cardData == nil {
+		return ""
+	}
+	if value, ok := cardData[key]; ok {
+		if str, ok := value.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func buildWeightsURL(modelID, requested string, files []huggingFaceModelFile) string {
+	candidate := strings.TrimSpace(requested)
+	if candidate == "" {
+		prioritySuffixes := []string{".safetensors", ".bin", ".gguf", ".pt"}
+		for _, suffix := range prioritySuffixes {
+			for _, file := range files {
+				if strings.HasSuffix(strings.ToLower(file.RFilename), suffix) {
+					candidate = file.RFilename
+					break
+				}
+			}
+			if candidate != "" {
+				break
+			}
+		}
+		if candidate == "" && len(files) > 0 {
+			candidate = files[0].RFilename
+		}
+	}
+
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return ""
+	}
+	if strings.HasPrefix(candidate, "http://") || strings.HasPrefix(candidate, "https://") {
+		return candidate
+	}
+	candidate = strings.TrimPrefix(candidate, "/")
+	return fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", modelID, candidate)
+}
+
+func deriveCapabilities(pipeline string, tags []string) []string {
+	capabilities := []string{}
+	if pipeline != "" {
+		capabilities = append(capabilities, strings.ToUpper(strings.ReplaceAll(pipeline, "-", "_")))
+	}
+	if len(capabilities) == 0 {
+		capabilities = append(capabilities, "GENERAL")
+	}
+	return capabilities
 }

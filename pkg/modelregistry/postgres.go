@@ -156,6 +156,22 @@ func (s *PostgresStore) CreateVersion(modelID string, input CreateVersionInput) 
 	if err != nil {
 		return ModelVersion{}, fmt.Errorf("marshal parameters: %w", err)
 	}
+	runnerManifest := input.RunnerManifest
+	if runnerManifest == nil {
+		runnerManifest = map[string]any{}
+	}
+	runnerManifestBytes, err := json.Marshal(runnerManifest)
+	if err != nil {
+		return ModelVersion{}, fmt.Errorf("marshal runner manifest: %w", err)
+	}
+	defaultParams := input.DefaultParameters
+	if defaultParams == nil {
+		defaultParams = map[string]any{}
+	}
+	defaultParamsBytes, err := json.Marshal(defaultParams)
+	if err != nil {
+		return ModelVersion{}, fmt.Errorf("marshal default parameters: %w", err)
+	}
 
 	status := input.Status
 	if strings.TrimSpace(status) == "" {
@@ -167,13 +183,16 @@ func (s *PostgresStore) CreateVersion(modelID string, input CreateVersionInput) 
 
 	const query = `
         INSERT INTO model_versions (
-            id, model_id, version, runner_image, weights_uri, min_gpu_mem_gb, min_vram_gb, max_batch_size,
+            id, model_id, version, runner_image, runner_family, runner_manifest, default_parameters,
+            weights_uri, min_gpu_mem_gb, min_vram_gb, max_batch_size,
             parameters, capabilities, latency_tier, artifact_uri, status, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8,
-            $9, $10, $11, $12, $13, $14, $15
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17, $18
         )
-        RETURNING id, model_id, version, runner_image, weights_uri, min_gpu_mem_gb, min_vram_gb, max_batch_size,
+        RETURNING id, model_id, version, runner_image, runner_family, runner_manifest, default_parameters,
+                  weights_uri, min_gpu_mem_gb, min_vram_gb, max_batch_size,
                   parameters, capabilities, latency_tier, artifact_uri, status, created_at, updated_at
     `
 
@@ -182,6 +201,9 @@ func (s *PostgresStore) CreateVersion(modelID string, input CreateVersionInput) 
 		modelID,
 		strings.TrimSpace(input.Version),
 		strings.TrimSpace(input.RunnerImage),
+		nullableString(input.RunnerFamily),
+		runnerManifestBytes,
+		defaultParamsBytes,
 		nullableString(input.WeightsURI),
 		nullableInt(input.MinGPUMemGB),
 		nullableInt(input.MinVRAMGB),
@@ -198,12 +220,81 @@ func (s *PostgresStore) CreateVersion(modelID string, input CreateVersionInput) 
 	return scanVersion(row)
 }
 
+func (s *PostgresStore) UpdateVersionRunnerConfig(modelID, versionID string, input UpdateRunnerConfigInput) (ModelVersion, error) {
+	if strings.TrimSpace(modelID) == "" {
+		return ModelVersion{}, fmt.Errorf("model_id is required")
+	}
+	if strings.TrimSpace(versionID) == "" {
+		return ModelVersion{}, fmt.Errorf("version_id is required")
+	}
+
+	setClauses := make([]string, 0, 6)
+	args := make([]any, 0, 8)
+	idx := 1
+
+	if input.RunnerImage != nil {
+		trimmed := strings.TrimSpace(*input.RunnerImage)
+		if trimmed == "" {
+			return ModelVersion{}, fmt.Errorf("runner_image cannot be empty")
+		}
+		setClauses = append(setClauses, fmt.Sprintf("runner_image = $%d", idx))
+		args = append(args, trimmed)
+		idx++
+	}
+	if input.RunnerFamily != nil {
+		setClauses = append(setClauses, fmt.Sprintf("runner_family = $%d", idx))
+		args = append(args, nullableString(input.RunnerFamily))
+		idx++
+	}
+	if input.RunnerManifest != nil {
+		manifestBytes, err := json.Marshal(input.RunnerManifest)
+		if err != nil {
+			return ModelVersion{}, fmt.Errorf("marshal runner manifest: %w", err)
+		}
+		setClauses = append(setClauses, fmt.Sprintf("runner_manifest = $%d", idx))
+		args = append(args, manifestBytes)
+		idx++
+	}
+	if input.DefaultParameters != nil {
+		paramsBytes, err := json.Marshal(input.DefaultParameters)
+		if err != nil {
+			return ModelVersion{}, fmt.Errorf("marshal default parameters: %w", err)
+		}
+		setClauses = append(setClauses, fmt.Sprintf("default_parameters = $%d", idx))
+		args = append(args, paramsBytes)
+		idx++
+	}
+
+	if len(setClauses) == 0 {
+		return ModelVersion{}, fmt.Errorf("no runner configuration fields provided")
+	}
+
+	setClauses = append(setClauses, fmt.Sprintf("updated_at = $%d", idx))
+	args = append(args, time.Now().UTC())
+	idx++
+
+	setSQL := strings.Join(setClauses, ", ")
+	query := fmt.Sprintf(`
+		UPDATE model_versions
+		SET %s
+		WHERE model_id = $%d AND id = $%d
+		RETURNING id, model_id, version, runner_image, runner_family, runner_manifest, default_parameters,
+		          weights_uri, min_gpu_mem_gb, min_vram_gb, max_batch_size,
+		          parameters, capabilities, latency_tier, artifact_uri, status, created_at, updated_at
+	`, setSQL, idx, idx+1)
+
+	args = append(args, modelID, versionID)
+
+	row := s.db.QueryRow(query, args...)
+	return scanVersion(row)
+}
+
 // ListModels returns models matching filters with their default version info.
 func (s *PostgresStore) ListModels(opts QueryOptions) ([]Model, error) {
 	const baseQuery = `
         SELECT m.id, m.external_id, m.display_name, m.family, m.description, m.metadata,
                m.status, m.default_version_id, m.created_at, m.updated_at,
-               dv.id, dv.version, dv.status, dv.runner_image, dv.created_at, dv.updated_at
+               dv.id, dv.version, dv.status, dv.runner_image, dv.runner_family, dv.created_at, dv.updated_at
         FROM models m
         LEFT JOIN model_versions dv ON dv.id = m.default_version_id
     `
@@ -280,7 +371,7 @@ func (s *PostgresStore) GetModel(id string) (Model, error) {
 	const query = `
         SELECT m.id, m.external_id, m.display_name, m.family, m.description, m.metadata,
                m.status, m.default_version_id, m.created_at, m.updated_at,
-               dv.id, dv.version, dv.status, dv.runner_image, dv.created_at, dv.updated_at
+               dv.id, dv.version, dv.status, dv.runner_image, dv.runner_family, dv.created_at, dv.updated_at
         FROM models m
         LEFT JOIN model_versions dv ON dv.id = m.default_version_id
         WHERE m.id = $1
@@ -379,6 +470,7 @@ func scanModelWithVersion(scanner interface{ Scan(dest ...any) error }) (Model, 
 		versionTag     sql.NullString
 		versionStatus  sql.NullString
 		runnerImage    sql.NullString
+		runnerFamily   sql.NullString
 		versionCreated sql.NullTime
 		versionUpdated sql.NullTime
 	)
@@ -398,6 +490,7 @@ func scanModelWithVersion(scanner interface{ Scan(dest ...any) error }) (Model, 
 		&versionTag,
 		&versionStatus,
 		&runnerImage,
+		&runnerFamily,
 		&versionCreated,
 		&versionUpdated,
 	)
@@ -424,6 +517,10 @@ func scanModelWithVersion(scanner interface{ Scan(dest ...any) error }) (Model, 
 			Status:      versionStatus.String,
 			RunnerImage: runnerImage.String,
 		}
+		if runnerFamily.Valid {
+			value := runnerFamily.String
+			info.RunnerFamily = &value
+		}
 		if versionCreated.Valid {
 			info.CreatedAt = versionCreated.Time
 		}
@@ -437,15 +534,18 @@ func scanModelWithVersion(scanner interface{ Scan(dest ...any) error }) (Model, 
 
 func scanVersion(scanner interface{ Scan(dest ...any) error }) (ModelVersion, error) {
 	var (
-		version       ModelVersion
-		weightsURI    sql.NullString
-		minGpuMem     sql.NullInt64
-		minVram       sql.NullInt64
-		maxBatch      sql.NullInt64
-		parametersRaw []byte
-		latencyTier   sql.NullString
-		artifactURI   sql.NullString
-		capabilities  []sql.NullString
+		version           ModelVersion
+		runnerFamily      sql.NullString
+		runnerManifestRaw []byte
+		defaultParamsRaw  []byte
+		weightsURI        sql.NullString
+		minGpuMem         sql.NullInt64
+		minVram           sql.NullInt64
+		maxBatch          sql.NullInt64
+		parametersRaw     []byte
+		latencyTier       sql.NullString
+		artifactURI       sql.NullString
+		capabilities      []sql.NullString
 	)
 
 	err := scanner.Scan(
@@ -453,6 +553,9 @@ func scanVersion(scanner interface{ Scan(dest ...any) error }) (ModelVersion, er
 		&version.ModelID,
 		&version.Version,
 		&version.RunnerImage,
+		&runnerFamily,
+		&runnerManifestRaw,
+		&defaultParamsRaw,
 		&weightsURI,
 		&minGpuMem,
 		&minVram,
@@ -471,6 +574,24 @@ func scanVersion(scanner interface{ Scan(dest ...any) error }) (ModelVersion, er
 
 	if weightsURI.Valid {
 		version.WeightsURI = &weightsURI.String
+	}
+	if runnerFamily.Valid {
+		value := runnerFamily.String
+		version.RunnerFamily = &value
+	}
+	if len(runnerManifestRaw) > 0 && string(runnerManifestRaw) != "null" {
+		if err := json.Unmarshal(runnerManifestRaw, &version.RunnerManifest); err != nil {
+			return ModelVersion{}, fmt.Errorf("decode runner manifest: %w", err)
+		}
+	} else {
+		version.RunnerManifest = map[string]any{}
+	}
+	if len(defaultParamsRaw) > 0 && string(defaultParamsRaw) != "null" {
+		if err := json.Unmarshal(defaultParamsRaw, &version.DefaultParameters); err != nil {
+			return ModelVersion{}, fmt.Errorf("decode default parameters: %w", err)
+		}
+	} else {
+		version.DefaultParameters = map[string]any{}
 	}
 	if minGpuMem.Valid {
 		v := int(minGpuMem.Int64)
@@ -497,6 +618,12 @@ func scanVersion(scanner interface{ Scan(dest ...any) error }) (ModelVersion, er
 		}
 	} else {
 		version.Parameters = map[string]any{}
+	}
+	if version.RunnerManifest == nil {
+		version.RunnerManifest = map[string]any{}
+	}
+	if version.DefaultParameters == nil {
+		version.DefaultParameters = map[string]any{}
 	}
 
 	version.Capabilities = flattenNullStringArray(capabilities)

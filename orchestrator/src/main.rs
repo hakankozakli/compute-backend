@@ -1,3 +1,6 @@
+mod config;
+mod control_plane;
+mod registry;
 mod state;
 
 use std::{convert::Infallible, net::SocketAddr};
@@ -16,30 +19,28 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 use crate::state::{
-    AppState,
-    CancelResponse,
-    CancelStatus,
-    JobDetailsResponse,
-    SubmitJobRequest,
-    SubmitJobResponse,
-    SyncRequest,
-    SyncResponse,
+    AppState, CancelResponse, CancelStatus, JobDetailsResponse, RunnerEventRequest,
+    SubmitJobRequest, SubmitJobResponse, SyncRequest, SyncResponse,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     setup_tracing()?;
 
-    let redis_url = std::env::var("REDIS_URL").ok();
-    let state = AppState::new(redis_url)?;
+    let cfg = config::Config::load()?;
+    let state = AppState::new(cfg).await?;
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/internal/jobs", post(submit_job))
         .route("/v1/internal/jobs/:request_id", get(get_job))
         .route("/v1/internal/jobs/:request_id/status", get(get_job_status))
-        .route("/v1/internal/jobs/:request_id/stream", get(stream_job_status))
+        .route(
+            "/v1/internal/jobs/:request_id/stream",
+            get(stream_job_status),
+        )
         .route("/v1/internal/jobs/:request_id/cancel", put(cancel_job))
+        .route("/v1/internal/runners/:job_id/events", post(runner_event))
         .route("/v1/internal/sync", post(sync_invoke))
         .with_state(state);
 
@@ -57,12 +58,21 @@ async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-async fn submit_job(State(state): State<AppState>, Json(payload): Json<SubmitJobRequest>) -> Result<(StatusCode, Json<SubmitJobResponse>), ApiError> {
-    let response = state.create_job(payload).await.map_err(ApiError::internal)?;
+async fn submit_job(
+    State(state): State<AppState>,
+    Json(payload): Json<SubmitJobRequest>,
+) -> Result<(StatusCode, Json<SubmitJobResponse>), ApiError> {
+    let response = state
+        .create_job(payload)
+        .await
+        .map_err(ApiError::internal)?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
-async fn get_job(State(state): State<AppState>, Path(request_id): Path<Uuid>) -> Result<Json<JobDetailsResponse>, ApiError> {
+async fn get_job(
+    State(state): State<AppState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<Json<JobDetailsResponse>, ApiError> {
     let details = state
         .job_details(request_id)
         .await
@@ -70,7 +80,10 @@ async fn get_job(State(state): State<AppState>, Path(request_id): Path<Uuid>) ->
     Ok(Json(details))
 }
 
-async fn get_job_status(State(state): State<AppState>, Path(request_id): Path<Uuid>) -> Result<Json<JobDetailsResponse>, ApiError> {
+async fn get_job_status(
+    State(state): State<AppState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<Json<JobDetailsResponse>, ApiError> {
     let details = state
         .job_details(request_id)
         .await
@@ -78,7 +91,10 @@ async fn get_job_status(State(state): State<AppState>, Path(request_id): Path<Uu
     Ok(Json(details))
 }
 
-async fn stream_job_status(State(state): State<AppState>, Path(request_id): Path<Uuid>) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+async fn stream_job_status(
+    State(state): State<AppState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let receiver = state
         .subscribe(request_id)
         .await
@@ -100,7 +116,10 @@ async fn stream_job_status(State(state): State<AppState>, Path(request_id): Path
     Ok(Sse::new(stream).keep_alive(KeepAlive::new()))
 }
 
-async fn cancel_job(State(state): State<AppState>, Path(request_id): Path<Uuid>) -> Result<(StatusCode, Json<CancelResponse>), ApiError> {
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<CancelResponse>), ApiError> {
     let status = state.cancel_job(request_id).await;
     if matches!(status, CancelStatus::NotFound) {
         return Err(ApiError::not_found());
@@ -115,9 +134,28 @@ async fn cancel_job(State(state): State<AppState>, Path(request_id): Path<Uuid>)
     Ok((status_code, Json(CancelResponse { status })))
 }
 
-async fn sync_invoke(State(state): State<AppState>, Json(payload): Json<SyncRequest>) -> Result<Json<SyncResponse>, ApiError> {
+async fn sync_invoke(
+    State(state): State<AppState>,
+    Json(payload): Json<SyncRequest>,
+) -> Result<Json<SyncResponse>, ApiError> {
     let result = state.run_sync(payload).await;
     Ok(Json(result))
+}
+
+async fn runner_event(
+    State(state): State<AppState>,
+    Path(job_id): Path<Uuid>,
+    Json(payload): Json<RunnerEventRequest>,
+) -> Result<(StatusCode, Json<JobDetailsResponse>), ApiError> {
+    state
+        .handle_runner_event(job_id, payload)
+        .await
+        .map_err(ApiError::internal)?;
+    let details = state
+        .job_details(job_id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok((StatusCode::ACCEPTED, Json(details)))
 }
 
 #[derive(Debug)]

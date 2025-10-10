@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	encodingbase64 "encoding/base64"
 	encodingjson "encoding/json"
 	errors "errors"
 	"fmt"
@@ -302,6 +303,22 @@ func NormalizePrivateKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return ""
+	}
+	if strings.Contains(key, "-----BEGIN") {
+		if !strings.HasSuffix(key, "\n") {
+			key += "\n"
+		}
+		return key
+	}
+	decoded, err := encodingbase64.StdEncoding.DecodeString(key)
+	if err == nil {
+		cleaned := strings.TrimSpace(string(decoded))
+		if strings.Contains(cleaned, "-----BEGIN") {
+			if !strings.HasSuffix(cleaned, "\n") {
+				cleaned += "\n"
+			}
+			return cleaned
+		}
 	}
 	return key + "\n"
 }
