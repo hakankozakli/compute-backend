@@ -261,6 +261,16 @@ func (s *Store) UpsertAssignment(id string, assignment ModelAssignment) (*Node, 
 		if !replaced {
 			n.Assignments = append(n.Assignments, assignment)
 		}
+		modelPresent := false
+		for _, model := range n.Models {
+			if strings.EqualFold(model, assignment.ModelID) {
+				modelPresent = true
+				break
+			}
+		}
+		if !modelPresent {
+			n.Models = append(n.Models, assignment.ModelID)
+		}
 		return nil
 	})
 }
@@ -297,6 +307,24 @@ func (s *Store) DeleteNode(id string) error {
 	delete(s.nodes, id)
 	delete(s.events, id)
 	return s.save()
+}
+
+func (s *Store) FindAssignmentForModel(modelID string) (*Node, *ModelAssignment) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, node := range s.nodes {
+		if node.Status != NodeStatusReady {
+			continue
+		}
+		for _, assignment := range node.Assignments {
+			if strings.EqualFold(assignment.ModelID, modelID) {
+				nCopy := *node
+				aCopy := assignment
+				return &nCopy, &aCopy
+			}
+		}
+	}
+	return nil, nil
 }
 
 func NormalizePrivateKey(key string) string {

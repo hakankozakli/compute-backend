@@ -13,6 +13,7 @@ type Repository interface {
 	Credentials(id string) (username, password string, ok bool)
 	UpdateSecrets(id, password, hfToken, dashscope string) error
 	UpsertAssignment(id string, assignment ModelAssignment) (*Node, error)
+	FindAssignmentForModel(modelID string) (*Node, *ModelAssignment)
 }
 
 var _ Repository = (*Store)(nil)

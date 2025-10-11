@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
+	"sort"
 
 	"github.com/vyvo/compute/backend/pkg/modelregistry"
 	"github.com/vyvo/compute/backend/pkg/orchestrator"
@@ -175,6 +176,23 @@ type huggingFaceModelFile struct {
 type jobsResponse struct {
 	Jobs  []jobSummary `json:"jobs"`
 	Total int          `json:"total"`
+}
+
+type redisJobRecord struct {
+	ID            string          `json:"id"`
+	Model         string          `json:"model"`
+	Status        string          `json:"status"`
+	Params        map[string]any  `json:"params"`
+	WorkerID      string          `json:"worker_id"`
+	NodeID        string          `json:"node_id"`
+	CreatedAt     int64           `json:"created_at"`
+	StartedAt     int64           `json:"started_at"`
+	CompletedAt   int64           `json:"completed_at"`
+	Result        json.RawMessage `json:"result"`
+	Error         string          `json:"error"`
+	Logs          []string        `json:"logs"`
+	BackendMode   string          `json:"backend_mode"`
+	BackendReason string          `json:"backend_reason"`
 }
 
 // Redis key management
@@ -430,22 +448,27 @@ func (s *server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
 
 // Job management
 func (s *server) handleListJobs(w http.ResponseWriter, r *http.Request) {
-	if s.jobDB == nil {
-		respondError(w, http.StatusServiceUnavailable, "job store not configured")
-		return
-	}
-
-	if err := s.ensureJobStoreReady(); err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
-		return
-	}
-
 	ctx := r.Context()
 	limit := 100
 	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 500 {
 			limit = parsed
 		}
+	}
+
+	if s.jobDB == nil {
+		jobs, err := s.listJobsFromRedis(ctx, limit)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("redis jobs: %v", err))
+			return
+		}
+		respondJSON(w, jobsResponse{Jobs: jobs, Total: len(jobs)}, http.StatusOK)
+		return
+	}
+
+	if err := s.ensureJobStoreReady(); err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
+		return
 	}
 
 	rows, err := s.jobDB.QueryContext(ctx, `
@@ -501,9 +524,131 @@ func (s *server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, jobsResponse{Jobs: jobs, Total: len(jobs)}, http.StatusOK)
 }
 
+func (s *server) listJobsFromRedis(ctx context.Context, limit int) ([]jobSummary, error) {
+	iter := s.redisClient.Scan(ctx, 0, "job:*", 0).Iterator()
+	summaries := make([]jobSummary, 0)
+
+	for iter.Next(ctx) {
+		key := iter.Val()
+		blob, err := s.redisClient.Get(ctx, key).Bytes()
+		if err != nil {
+			return nil, err
+		}
+		var record redisJobRecord
+		if err := json.Unmarshal(blob, &record); err != nil {
+			log.Printf("decode redis job %s: %v", key, err)
+			continue
+		}
+		created := record.CreatedAt
+		updated := record.CompletedAt
+		if updated == 0 {
+			updated = record.StartedAt
+		}
+		if updated == 0 {
+			updated = record.CreatedAt
+		}
+		summaries = append(summaries, jobSummary{
+			RequestID: record.ID,
+			ModelID:   record.Model,
+			Status:    strings.ToUpper(record.Status),
+			CreatedAt: created,
+			UpdatedAt: updated,
+			WorkerID:  record.WorkerID,
+			QueuePos:  nil,
+		})
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].CreatedAt > summaries[j].CreatedAt
+	})
+	if len(summaries) > limit {
+		summaries = summaries[:limit]
+	}
+	return summaries, nil
+}
+
+func (s *server) redisJobDetail(ctx context.Context, jobID string) (*jobDetail, error) {
+	key := fmt.Sprintf("job:%s", jobID)
+	blob, err := s.redisClient.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		return nil, fmt.Errorf("job not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	var record redisJobRecord
+	if err := json.Unmarshal(blob, &record); err != nil {
+		return nil, err
+	}
+	created := time.Unix(record.CreatedAt, 0)
+	updatedTs := record.CompletedAt
+	if updatedTs == 0 {
+		updatedTs = record.StartedAt
+	}
+	if updatedTs == 0 {
+		updatedTs = record.CreatedAt
+	}
+	updated := time.Unix(updatedTs, 0)
+
+	logs := record.Logs
+	if logs == nil {
+		logs = []string{}
+	}
+	artifacts := []json.RawMessage{}
+	if len(record.Result) > 0 {
+		var resultPayload map[string]any
+		if err := json.Unmarshal(record.Result, &resultPayload); err == nil {
+			if rawArtifacts, ok := resultPayload["artifacts"].([]any); ok {
+				for _, item := range rawArtifacts {
+					if data, err := json.Marshal(item); err == nil {
+						artifacts = append(artifacts, data)
+					}
+				}
+			}
+		}
+	}
+
+	detail := &jobDetail{
+		ID:        record.ID,
+		ModelID:   record.Model,
+		Status:    strings.ToUpper(record.Status),
+		Logs:      logs,
+		Artifacts: artifacts,
+		CreatedAt: created,
+		UpdatedAt: updated,
+		Events:    []jobEvent{},
+	}
+	if record.NodeID != "" {
+		detail.NodeID = &record.NodeID
+	} else if record.WorkerID != "" {
+		worker := record.WorkerID
+		detail.NodeID = &worker
+	}
+	if len(record.Params) > 0 {
+		if payloadBytes, err := json.Marshal(record.Params); err == nil {
+			detail.Payload = payloadBytes
+		}
+	}
+	if len(record.Result) > 0 {
+		detail.Result = record.Result
+	}
+	return detail, nil
+}
+
 func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "jobID")
+	ctx := r.Context()
+
 	if s.jobDB == nil {
-		respondError(w, http.StatusServiceUnavailable, "job store not configured")
+		detail, err := s.redisJobDetail(ctx, jobID)
+		if err != nil {
+			respondError(w, http.StatusNotFound, "job not found")
+			return
+		}
+		respondJSON(w, detail, http.StatusOK)
 		return
 	}
 
@@ -511,9 +656,6 @@ func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("ensure job store: %v", err))
 		return
 	}
-
-	jobID := chi.URLParam(r, "jobID")
-	ctx := r.Context()
 
 	var (
 		id             string

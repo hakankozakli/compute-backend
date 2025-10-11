@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -24,6 +25,7 @@ type Job struct {
 	Status      JobStatus              `json:"status"`
 	Params      map[string]interface{} `json:"params"`
 	WorkerID    string                 `json:"worker_id,omitempty"`
+	NodeID      string                 `json:"node_id,omitempty"`
 	CreatedAt   int64                  `json:"created_at"`
 	StartedAt   int64                  `json:"started_at,omitempty"`
 	CompletedAt int64                  `json:"completed_at,omitempty"`
@@ -64,7 +66,13 @@ func (q *Queue) EnqueueJob(ctx context.Context, job *Job) error {
 		return err
 	}
 
-	// Add to queue
+	// Add to queues
+	if strings.TrimSpace(job.NodeID) != "" {
+		nodeQueue := fmt.Sprintf("queue:%s:%s", job.NodeID, job.Model)
+		if err := q.redis.RPush(ctx, nodeQueue, job.ID).Err(); err != nil {
+			return err
+		}
+	}
 	queueKey := fmt.Sprintf("queue:%s", job.Model)
 	return q.redis.RPush(ctx, queueKey, job.ID).Err()
 }

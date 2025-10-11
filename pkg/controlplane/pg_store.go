@@ -250,8 +250,45 @@ func (s *PostgresStore) UpsertAssignment(id string, assignment ModelAssignment) 
 		if !replaced {
 			n.Assignments = append(n.Assignments, assignment)
 		}
+		modelPresent := false
+		for _, model := range n.Models {
+			if strings.EqualFold(model, assignment.ModelID) {
+				modelPresent = true
+				break
+			}
+		}
+		if !modelPresent {
+			n.Models = append(n.Models, assignment.ModelID)
+		}
 		return nil
 	})
+}
+
+func (s *PostgresStore) FindAssignmentForModel(modelID string) (*Node, *ModelAssignment) {
+	rows, err := s.db.Query(`SELECT data FROM control_plane_nodes WHERE data->>'status' = 'READY' ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var node Node
+		if err := json.Unmarshal(raw, &node); err != nil {
+			continue
+		}
+		for _, assignment := range node.Assignments {
+			if strings.EqualFold(assignment.ModelID, modelID) {
+				nCopy := node
+				aCopy := assignment
+				return &nCopy, &aCopy
+			}
+		}
+	}
+	return nil, nil
 }
 
 func (s *PostgresStore) saveNode(node *Node) error {

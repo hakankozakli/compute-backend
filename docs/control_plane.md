@@ -54,12 +54,13 @@ Provisioning logs and status transitions are available through the `/api/nodes/{
 
 ## Recognised models
 
-Currently the control plane generates configuration for:
+The control plane now renders a Docker Compose stack for each assigned model. When you edit a node from the admin panel and toggle the **Models** list, the backend regenerates the stack and redeploys the runner automatically.
 
-- `qwen-image` – runs the `Qwen/Qwen-Image` diffusers checkpoint.
-- `qwen-image-dashscope` – configures DashScope as a fallback backend.
+- `black-forest-labs/FLUX.1-dev` – provisions the Flux diffusers runner (`ghcr.io/vyvo/runner-flux:latest`) with GPU reservations, `FLUX_ENABLE_DIFFUSERS=1`, and Hugging Face credentials pulled from the node record.
+- `qwen-image` – runs the `Qwen/Qwen-Image` diffusers checkpoint alongside a MinIO sidecar for artifact storage.
+- `qwen-image-dashscope` – configures DashScope as a fallback backend and shares the same runner container.
 
-Unknown model identifiers are preserved with a TODO comment in the generated env file for manual configuration.
+Set `RUNNER_CALLBACK_URL` (and optionally `RUNNER_CALLBACK_TOKEN`) in the control plane environment if your remote runners should stream status updates back to the orchestrator. The generated stack always includes `/etc/vyvo/runner.env` with `REDIS_URL`, `VYVO_NODE_ID`, and any secrets you captured when registering the node, so no manual edits are required on the host.
 
 ## Docker Compose
 

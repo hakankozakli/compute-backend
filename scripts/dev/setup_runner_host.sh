@@ -12,6 +12,7 @@ COMPOSE_VERSION="v2.29.2"
 REPO_ROOT="/opt/vyvo"
 SERVICE_USER="vyvo"
 ENV_FILE="/etc/vyvo/qwen.env"
+MODEL_CONFIG="/etc/vyvo/models.json"
 
 log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
@@ -117,80 +118,32 @@ configure_runtime() {
 }
 
 layout_repo() {
-  log "Laying out repository in $REPO_ROOT"
+  log "Preparing runner workspace in $REPO_ROOT"
   mkdir -p "$REPO_ROOT"
-  chown "$SERVICE_USER" "$REPO_ROOT"
+  chown "$SERVICE_USER":"$SERVICE_USER" "$REPO_ROOT"
 
   mkdir -p "$(dirname "$ENV_FILE")"
   if [[ ! -f "$ENV_FILE" ]]; then
     cat <<'ENV' > "$ENV_FILE"
 # Qwen image runner environment
-# Uncomment and populate the values below.
-# === Local diffusers backend (recommended for on-prem GPUs) ===
-# QWEN_DIFFUSERS_MODEL=Qwen/Qwen-Image
-# HF_TOKEN=hf_xxx  # only if the model requires auth
-# QWEN_TORCH_DTYPE=float16
-# QWEN_DEVICE=cuda
-# QWEN_TRUST_REMOTE_CODE=1
-# QWEN_ENABLE_XFORMERS=1
-# === DashScope fallback ===
-# DASHSCOPE_API_KEY=your_dashscope_key
-# QWEN_IMAGE_MODEL=wanx2.1
-# QWEN_IMAGE_SIZE=1024*1024
+# Populated automatically by the control plane when Qwen is assigned to a node.
 ENV
     chown "$SERVICE_USER":"$SERVICE_USER" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
   fi
 
-  cat <<COMPOSE > "$REPO_ROOT/docker-compose.yml"
-services:
-  minio:
-    image: minio/minio:latest
-    restart: unless-stopped
-    command: server /data --console-address ":9090"
-    environment:
-      MINIO_ROOT_USER: vyvo
-      MINIO_ROOT_PASSWORD: vyvo-secure-password-change-me
-    ports:
-      - "9000:9000"
-      - "9090:9090"
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
+  if [[ -f "$MODEL_CONFIG" ]]; then
+    chown "$SERVICE_USER":"$SERVICE_USER" "$MODEL_CONFIG"
+    chmod 600 "$MODEL_CONFIG"
+  fi
 
-  qwen-image:
-    image: ghcr.io/hakankozakli/runner-qwen:latest
-    restart: unless-stopped
-    runtime: nvidia
-    depends_on:
-      - minio
-    env_file:
-      - $ENV_FILE
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      VYVO_MODEL_ID: qwen/image
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: vyvo
-      MINIO_SECRET_KEY: vyvo-secure-password-change-me
-      MINIO_BUCKET: generated-images
-      MINIO_SECURE: "false"
-    ports:
-      - "9001:9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9001/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  minio-data:
+  if [[ ! -f "$REPO_ROOT/docker-compose.yml" ]]; then
+    cat <<'COMPOSE' > "$REPO_ROOT/docker-compose.yml"
+version: "3.9"
+services: {}
 COMPOSE
-
-  chown "$SERVICE_USER":"$SERVICE_USER" "$REPO_ROOT"/docker-compose.yml
+    chown "$SERVICE_USER":"$SERVICE_USER" "$REPO_ROOT"/docker-compose.yml
+  fi
 }
 
 install_services() {

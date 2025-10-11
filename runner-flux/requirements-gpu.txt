@@ -1,0 +1,5 @@
+diffusers==0.30.0
+transformers==4.44.2
+safetensors==0.4.4
+accelerate==0.34.2
+xformers==0.0.27.post2

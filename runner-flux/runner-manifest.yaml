@@ -1,0 +1,47 @@
+id: diffusers/flux
+name: Flux Dev Diffusers Runner
+runner_image: ghcr.io/vyvo/runner-flux:latest
+parameters:
+  prompt:
+    type: text
+    required: true
+    default: "Quick smoke-test render of the Vyvo logo glowing above a reflective surface at dusk."
+  negative_prompt:
+    type: text
+    required: false
+  steps:
+    type: integer
+    default: 12
+    min: 1
+    max: 50
+  guidance_scale:
+    type: number
+    default: 4.0
+    min: 0
+    max: 20
+    step: 0.1
+  width:
+    type: integer
+    default: 768
+    min: 256
+    max: 2048
+    step: 64
+  height:
+    type: integer
+    default: 768
+    min: 256
+    max: 2048
+    step: 64
+  seed:
+    type: integer
+    required: false
+  image_count:
+    type: integer
+    default: 1
+    min: 1
+    max: 4
+capabilities:
+  - text-to-image
+notes:
+  - "Requires CUDA-enabled GPU with >=24GB VRAM"
+  - "Set FLUX_ENABLE_DIFFUSERS=1 to enable diffusers backend"
