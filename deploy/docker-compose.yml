@@ -90,6 +90,7 @@ services:
       - "3002:3002"
     depends_on:
       - redis
+      - postgres
 
   flux_runner:
     build:
@@ -137,6 +138,18 @@ services:
     depends_on:
       - gateway
       - orchestrator
+
+  ngrok-minio:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    command:
+      - "http"
+      - "--log=stdout"
+      - "minio:9000"
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    depends_on:
+      - minio
 
 volumes:
   postgres_data:
